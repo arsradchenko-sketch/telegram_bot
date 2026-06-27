@@ -10,10 +10,6 @@ from telethon import TelegramClient
 from telethon.tl.functions.messages import SendReactionRequest, RequestWebViewRequest
 from telethon.tl.types import ReactionEmoji
 
-# ===== ОГРАНИЧЕНИЕ ПАМЯТИ (ЧТОБЫ НЕ ЖРАЛ ВСЮ RAM) =====
-import resource
-resource.setrlimit(resource.RLIMIT_AS, (512 * 1024 * 1024, -1))
-
 # ==================================================
 # 🔥 ДАННЫЕ БЕРУТСЯ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ 🔥
 # ==================================================
@@ -237,19 +233,38 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Нет активных аккаунтов!")
             del user_states[user_id]
             return
+        
+        success_count = 0
+        error_count = 0
+        report = []
         await update.message.reply_text(f"🚀 Ставлю {emoji} на {len(accounts)} аккаунтах...")
+        
         for acc in accounts:
             acc_id, phone, session_path, status, name, status_info, created_at = acc
             await update.message.reply_text(f"🔄 {phone}...")
             result = await set_reaction(session_path, link, emoji)
+            
             if result['success']:
+                success_count += 1
                 add_action(acc_id, 'reaction', link, 'success')
-                await update.message.reply_text(f"✅ {phone} — {result['emoji']}")
+                report.append(f"✅ {phone} — {result['emoji']}")
             else:
+                error_count += 1
                 add_action(acc_id, 'reaction', link, 'error')
-                await update.message.reply_text(f"❌ {phone} — {result['error']}")
+                report.append(f"❌ {phone} — {result['error']}")
+            
             await asyncio.sleep(3)
-        await update.message.reply_text(f"✅ Готово!")
+        
+        total = success_count + error_count
+        report_text = f"📊 **Отчет по реакциям:**\n\n"
+        report_text += f"✅ Успешно: {success_count}\n"
+        report_text += f"❌ Ошибок: {error_count}\n"
+        report_text += f"📌 Всего: {total}\n\n"
+        report_text += "Детали:\n" + "\n".join(report[:10])
+        if len(report) > 10:
+            report_text += f"\n... и еще {len(report) - 10} аккаунтов"
+        
+        await update.message.reply_text(report_text, parse_mode="Markdown")
         del user_states[user_id]
         return
     
@@ -263,19 +278,38 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Нет активных аккаунтов!")
             del user_states[user_id]
             return
+        
+        success_count = 0
+        error_count = 0
+        report = []
         await update.message.reply_text(f"🚀 Запускаю абуз на {len(accounts)} аккаунтах...")
+        
         for acc in accounts:
             acc_id, phone, session_path, status, name, status_info, created_at = acc
             await update.message.reply_text(f"🔄 {phone}...")
             result = await open_tapp(session_path, link)
+            
             if result['success']:
+                success_count += 1
                 add_action(acc_id, 'tapp', link, 'success')
-                await update.message.reply_text(f"✅ {phone} — успешно! @{result['bot']}")
+                report.append(f"✅ {phone} — успешно! @{result['bot']}")
             else:
+                error_count += 1
                 add_action(acc_id, 'tapp', link, 'error')
-                await update.message.reply_text(f"❌ {phone} — {result['error']}")
+                report.append(f"❌ {phone} — ошибка: {result['error']}")
+            
             await asyncio.sleep(3)
-        await update.message.reply_text(f"✅ Готово!")
+        
+        total = success_count + error_count
+        report_text = f"📊 **Отчет по абузу:**\n\n"
+        report_text += f"✅ Успешно: {success_count}\n"
+        report_text += f"❌ Ошибок: {error_count}\n"
+        report_text += f"📌 Всего: {total}\n\n"
+        report_text += "Детали:\n" + "\n".join(report[:10])
+        if len(report) > 10:
+            report_text += f"\n... и еще {len(report) - 10} аккаунтов"
+        
+        await update.message.reply_text(report_text, parse_mode="Markdown")
         del user_states[user_id]
         return
 
