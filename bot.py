@@ -19,8 +19,12 @@ API_ID = int(os.environ.get("API_ID"))
 API_HASH = os.environ.get("API_HASH")
 # ==================================================
 
+# ===== СОЗДАЁМ ПАПКИ ДЛЯ ХРАНЕНИЯ =====
+os.makedirs("data", exist_ok=True)
+os.makedirs("data/sessions", exist_ok=True)
+
 # ===== БАЗА ДАННЫХ =====
-conn = sqlite3.connect("accounts.db", check_same_thread=False)
+conn = sqlite3.connect("data/accounts.db", check_same_thread=False)
 cursor = conn.cursor()
 cursor.execute('''
     CREATE TABLE IF NOT EXISTS accounts (
@@ -67,7 +71,6 @@ def add_action(account_id, action_type, target, status):
 
 # ===== СОСТОЯНИЯ =====
 user_states = {}
-os.makedirs("sessions", exist_ok=True)
 logging.basicConfig(level=logging.INFO)
 
 # ===== РЕАКЦИЯ НА ПОСТ =====
@@ -139,6 +142,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
         [InlineKeyboardButton("➕ Добавить аккаунт", callback_data="add")],
+        [InlineKeyboardButton("📂 Загрузить сессию", callback_data="upload_session")],
         [InlineKeyboardButton("📋 Список", callback_data="list")],
         [InlineKeyboardButton("🔥 Реакции", callback_data="reaction")],
         [InlineKeyboardButton("🚀 Абуз TApp", callback_data="abuse")],
@@ -174,14 +178,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await update.message.reply_text(f"🚀 Ставлю {emoji} на {len(accounts)} аккаунтах...")
         for acc in accounts:
-            acc_id, phone, session_path, status, created_at = acc
+            phone = acc[1]
+            session_path = acc[2]
             await update.message.reply_text(f"🔄 {phone}...")
             result = await set_reaction(session_path, link, emoji)
             if result['success']:
-                add_action(acc_id, 'reaction', link, 'success')
+                add_action(acc[0], 'reaction', link, 'success')
                 await update.message.reply_text(f"✅ {phone} — {result['emoji']}")
             else:
-                add_action(acc_id, 'reaction', link, 'error')
+                add_action(acc[0], 'reaction', link, 'error')
                 await update.message.reply_text(f"❌ {phone} — {result['error']}")
             await asyncio.sleep(3)
         await update.message.reply_text(f"✅ Готово!")
@@ -201,14 +206,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await update.message.reply_text(f"🚀 Запускаю абуз на {len(accounts)} аккаунтах...")
         for acc in accounts:
-            acc_id, phone, session_path, status, created_at = acc
+            phone = acc[1]
+            session_path = acc[2]
             await update.message.reply_text(f"🔄 {phone}...")
             result = await open_tapp(session_path, link)
             if result['success']:
-                add_action(acc_id, 'tapp', link, 'success')
+                add_action(acc[0], 'tapp', link, 'success')
                 await update.message.reply_text(f"✅ {phone} — успешно! @{result['bot']}")
             else:
-                add_action(acc_id, 'tapp', link, 'error')
+                add_action(acc[0], 'tapp', link, 'error')
                 await update.message.reply_text(f"❌ {phone} — {result['error']}")
             await asyncio.sleep(3)
         await update.message.reply_text(f"✅ Готово!")
@@ -221,10 +227,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Формат: +71234567890")
             return
         try:
-            client = TelegramClient(f"sessions/{text}", API_ID, API_HASH)
+            session_path = f"data/sessions/{text}.session"
+            client = TelegramClient(session_path, API_ID, API_HASH)
             await client.connect()
             await client.send_code_request(text)
-            user_states[user_id] = {'step': 'waiting_code', 'phone': text, 'client': client}
+            user_states[user_id] = {'step': 'waiting_code', 'phone': text, 'client': client, 'session_path': session_path}
             await update.message.reply_text(f"📱 Код на {text}\nВведи код:")
         except Exception as e:
             await update.message.reply_text(f"❌ Ошибка: {e}")
@@ -234,7 +241,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if state.get('step') == 'waiting_code':
         try:
             await state['client'].sign_in(state['phone'], text)
-            add_account(state['phone'], f"sessions/{state['phone']}")
+            add_account(state['phone'], state['session_path'])
             await update.message.reply_text(f"✅ Аккаунт {state['phone']} добавлен!")
             await state['client'].disconnect()
             del user_states[user_id]
@@ -250,7 +257,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if state.get('step') == 'waiting_password':
         try:
             await state['client'].sign_in(password=text)
-            add_account(state['phone'], f"sessions/{state['phone']}")
+            add_account(state['phone'], state['session_path'])
             await update.message.reply_text(f"✅ Аккаунт {state['phone']} добавлен!")
             await state['client'].disconnect()
             del user_states[user_id]
@@ -258,32 +265,91 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Неверный пароль: {e}")
         return
 
-# ===== КНОПКИ =====
+# ===== ОБРАБОТКА ФАЙЛОВ (ЗАГРУЗКА СЕССИЙ) =====
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
+        return
+    
+    state = user_states.get(user_id, {})
+    if state.get('step') != 'waiting_session_file':
+        await update.message.reply_text("❌ Сначала нажми кнопку 'Загрузить сессию' в меню!")
+        return
+    
+    document = update.message.document
+    if not document:
+        await update.message.reply_text("❌ Отправь файл, а не текст!")
+        return
+    
+    if not document.file_name.endswith('.session'):
+        await update.message.reply_text("❌ Файл должен иметь расширение `.session`")
+        return
+    
+    await update.message.reply_text("⏳ Загружаю файл на сервер...")
+    
+    try:
+        file = await document.get_file()
+        session_path = f"data/sessions/{document.file_name}"
+        os.makedirs("data/sessions", exist_ok=True)
+        await file.download_to_drive(session_path)
+        
+        phone = document.file_name.replace('.session', '')
+        if not phone.startswith('+'):
+            phone = '+' + phone
+        
+        cursor.execute('INSERT INTO accounts (phone, session_path, created_at) VALUES (?, ?, ?)',
+                      (phone, session_path, datetime.now().isoformat()))
+        conn.commit()
+        
+        await update.message.reply_text(f"✅ Аккаунт {phone} добавлен!\n📁 Файл: {session_path}")
+        del user_states[user_id]
+        
+    except sqlite3.IntegrityError:
+        await update.message.reply_text(f"❌ Аккаунт уже существует в базе!")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
+# ===== ОБРАБОТКА КНОПОК =====
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if query.from_user.id != ADMIN_ID:
         await query.answer("Доступ запрещен!", show_alert=True)
         return
     await query.answer()
+    
     if query.data == "stats":
         accounts = get_accounts()
         total = get_stats()
-        await query.edit_message_text(f"📊 Всего: {total}\n✅ Активных: {len(accounts)}")
+        await query.edit_message_text(f"📊 Всего аккаунтов: {total}\n✅ Активных: {len(accounts)}")
+    
     elif query.data == "add":
         await query.edit_message_text("📱 Отправь номер:\n`+71234567890`", parse_mode="Markdown")
         user_states[query.from_user.id] = {'step': 'waiting_phone'}
+    
+    elif query.data == "upload_session":
+        await query.edit_message_text(
+            "📂 **Загрузка сессии**\n\n"
+            "Отправь файл сессии (с расширением `.session`).\n"
+            "Файл можно найти в папке Telegram Desktop: `tdata`\n\n"
+            "Или используй бота @session_importer для создания сессии.",
+            parse_mode="Markdown"
+        )
+        user_states[query.from_user.id] = {'step': 'waiting_session_file'}
+    
     elif query.data == "list":
         accounts = get_accounts()
         if not accounts:
-            await query.edit_message_text("📋 Пусто")
+            await query.edit_message_text("📋 Список пуст")
             return
         text = "📋 Аккаунты:\n"
         for acc in accounts:
             text += f"📱 {acc[1]}\n"
         await query.edit_message_text(text)
+    
     elif query.data == "reaction":
         await query.edit_message_text("🔥 Отправь ссылку на пост:\n`https://t.me/durov/123`", parse_mode="Markdown")
         user_states[query.from_user.id] = {'step': 'waiting_reaction_link'}
+    
     elif query.data == "abuse":
         await query.edit_message_text("🚀 Отправь ссылку TApp:\n`https://t.me/bot/app?startapp=ref`", parse_mode="Markdown")
         user_states[query.from_user.id] = {'step': 'waiting_link'}
@@ -295,4 +361,5 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.run_polling()
