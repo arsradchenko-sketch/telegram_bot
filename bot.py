@@ -13,10 +13,10 @@ from telethon.tl.types import ReactionEmoji
 # ==================================================
 # 🔥 ДАННЫЕ БЕРУТСЯ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ 🔥
 # ==================================================
-TOKEN = os.environ.get("8943768757:AAEHmn1a9Bo3ryCF8snuy0-IxeMYA_YtGfY")
+TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_ID = int(os.environ.get("ADMIN_ID"))
-API_ID = int(os.environ.get("32287172"))
-API_HASH = os.environ.get("be028c5a2368a336042b48a00c017a98")
+API_ID = int(os.environ.get("API_ID"))
+API_HASH = os.environ.get("API_HASH")
 # ==================================================
 
 # ===== БАЗА ДАННЫХ =====
