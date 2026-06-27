@@ -10,6 +10,10 @@ from telethon import TelegramClient
 from telethon.tl.functions.messages import SendReactionRequest, RequestWebViewRequest
 from telethon.tl.types import ReactionEmoji
 
+# ===== ОГРАНИЧЕНИЕ ПАМЯТИ (ЧТОБЫ НЕ ЖРАЛ ВСЮ RAM) =====
+import resource
+resource.setrlimit(resource.RLIMIT_AS, (512 * 1024 * 1024, -1))
+
 # ==================================================
 # 🔥 ДАННЫЕ БЕРУТСЯ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ 🔥
 # ==================================================
