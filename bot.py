@@ -5,6 +5,8 @@ import sqlite3
 import os
 import re
 import asyncio
+import zipfile
+import shutil
 from datetime import datetime
 from telethon import TelegramClient
 from telethon.tl.functions.messages import SendReactionRequest, RequestWebViewRequest
@@ -163,7 +165,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     await update.message.reply_text("👋 Выбери:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-# ===== ОБРАБОТКА ФАЙЛОВ (ПРИНИМАЕТ НЕСКОЛЬКО) =====
+# ===== ОБРАБОТКА ФАЙЛОВ (ZIP ИЛИ .SESSION) =====
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != ADMIN_ID:
@@ -172,70 +174,113 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if state.get('step') != 'waiting_session_file':
         await update.message.reply_text("❌ Сначала нажми кнопку 'Загрузить сессию' в меню!")
         return
-    
-    # Получаем все файлы из сообщения (если их несколько)
-    documents = []
-    if update.message.document:
-        documents.append(update.message.document)
-    
-    if not documents:
-        await update.message.reply_text("❌ Отправь файл .session!")
+    document = update.message.document
+    if not document:
+        await update.message.reply_text("❌ Отправь файл!")
         return
     
-    # Обрабатываем все файлы
-    added_count = 0
-    error_count = 0
-    report = []
-    
-    for doc in documents:
-        if not doc.file_name.endswith('.session'):
-            report.append(f"❌ {doc.file_name} — не .session файл")
-            error_count += 1
-            continue
-        
+    # ===== ЕСЛИ ZIP =====
+    if document.file_name.endswith('.zip'):
+        await update.message.reply_text("⏳ Загружаю и распаковываю архив...")
         try:
-            file = await doc.get_file()
-            session_path = f"data/sessions/{doc.file_name}"
-            os.makedirs("data/sessions", exist_ok=True)
-            await file.download_to_drive(session_path)
+            file = await document.get_file()
+            zip_path = f"/tmp/{document.file_name}"
+            await file.download_to_drive(zip_path)
             
-            # Достаём номер из сессии
-            client = TelegramClient(session_path, API_ID, API_HASH)
-            await client.connect()
-            if await client.is_user_authorized():
-                me = await client.get_me()
-                phone = me.phone
-            else:
-                phone = doc.file_name.replace('.session', '')
-            await client.disconnect()
+            extract_path = "/tmp/sessions_extract"
+            os.makedirs(extract_path, exist_ok=True)
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(extract_path)
             
-            if not phone.startswith('+'):
-                phone = '+' + phone
+            # Ищем папку sessions/
+            sessions_path = None
+            for root, dirs, files in os.walk(extract_path):
+                if "sessions" in dirs:
+                    sessions_path = os.path.join(root, "sessions")
+                    break
+                if any(f.endswith('.session') for f in files):
+                    sessions_path = extract_path
+                    break
             
-            # Добавляем в базу
-            cursor.execute('INSERT INTO accounts (phone, session_path, created_at) VALUES (?, ?, ?)',
-                          (phone, session_path, datetime.now().isoformat()))
-            conn.commit()
-            report.append(f"✅ {phone} — добавлен")
-            added_count += 1
+            if not sessions_path:
+                await update.message.reply_text("❌ В архиве нет папки 'sessions' или файлов .session!")
+                os.remove(zip_path)
+                shutil.rmtree(extract_path)
+                return
             
-        except sqlite3.IntegrityError:
-            report.append(f"❌ {doc.file_name} — уже существует в базе")
-            error_count += 1
+            session_files = [f for f in os.listdir(sessions_path) if f.endswith('.session')]
+            if not session_files:
+                await update.message.reply_text("❌ Нет файлов .session!")
+                os.remove(zip_path)
+                shutil.rmtree(extract_path)
+                return
+            
+            added = 0
+            for session_file in session_files:
+                src = os.path.join(sessions_path, session_file)
+                dst = f"data/sessions/{session_file}"
+                shutil.copy2(src, dst)
+                
+                phone = session_file.replace('.session', '')
+                try:
+                    client = TelegramClient(dst, API_ID, API_HASH)
+                    await client.connect()
+                    if await client.is_user_authorized():
+                        me = await client.get_me()
+                        phone = me.phone
+                    await client.disconnect()
+                except:
+                    pass
+                
+                if not phone.startswith('+'):
+                    phone = '+' + phone
+                
+                if add_account(phone, dst):
+                    added += 1
+            
+            await update.message.reply_text(f"✅ Добавлено {added} аккаунтов из {len(session_files)} сессий!")
+            del user_states[user_id]
+            
+            os.remove(zip_path)
+            shutil.rmtree(extract_path)
+            
         except Exception as e:
-            report.append(f"❌ {doc.file_name} — ошибка: {e}")
-            error_count += 1
+            await update.message.reply_text(f"❌ Ошибка: {e}")
+        return
     
-    # Отчёт
-    result_text = f"📊 **Результат загрузки:**\n\n"
-    result_text += f"✅ Добавлено: {added_count}\n"
-    result_text += f"❌ Ошибок: {error_count}\n\n"
-    result_text += "Детали:\n" + "\n".join(report[:15])
-    if len(report) > 15:
-        result_text += f"\n... и еще {len(report) - 15} файлов"
+    # ===== ЕСЛИ .SESSION =====
+    if not document.file_name.endswith('.session'):
+        await update.message.reply_text("❌ Отправь .session или ZIP!")
+        return
     
-    await update.message.reply_text(result_text, parse_mode="Markdown")
-    del user_states[user_id]
+    await update.message.reply_text("⏳ Загружаю сессию...")
+    try:
+        file = await document.get_file()
+        session_path = f"data/sessions/{document.file_name}"
+        os.makedirs("data/sessions", exist_ok=True)
+        await file.download_to_drive(session_path)
+        
+        client = TelegramClient(session_path, API_ID, API_HASH)
+        await client.connect()
+        if await client.is_user_authorized():
+            me = await client.get_me()
+            phone = me.phone
+        else:
+            phone = document.file_name.replace('.session', '')
+        await client.disconnect()
+        
+        if not phone.startswith('+'):
+            phone = '+' + phone
+        
+        cursor.execute('INSERT INTO accounts (phone, session_path, created_at) VALUES (?, ?, ?)',
+                      (phone, session_path, datetime.now().isoformat()))
+        conn.commit()
+        await update.message.reply_text(f"✅ Аккаунт {phone} добавлен!")
+        del user_states[user_id]
+    except sqlite3.IntegrityError:
+        await update.message.reply_text(f"❌ Аккаунт уже существует!")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
 
 # ===== ВЫБОР АККАУНТОВ =====
 async def select_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE, action_type: str, link: str = None, emoji: str = None):
@@ -294,7 +339,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await select_accounts(update, context, 'abuse', link)
         return
 
-# ===== ОБРАБОТКА КНОПОК =====
+# ===== КНОПКИ =====
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
@@ -385,7 +430,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "📂 **Загрузка сессии**\n\n"
             "Отправь один или несколько файлов `.session`.\n"
-            "Бот добавит все аккаунты автоматически.",
+            "ИЛИ отправь ZIP-архив с папкой `sessions/` — бот распакует и добавит все аккаунты.",
             parse_mode="Markdown"
         )
         user_states[query.from_user.id] = {'step': 'waiting_session_file'}
