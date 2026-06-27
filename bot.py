@@ -90,7 +90,7 @@ async def set_reaction(session_path, link, emoji="🔥"):
             await client(SendReactionRequest(
                 peer=entity,
                 msg_id=post_id,
-                reaction=[ReactionEmoji(emoticons=[emoji])]
+                reaction=[ReactionEmoji(emoticon=emoji)]
             ))
             await client.disconnect()
             return {'success': True, 'emoji': emoji, 'channel': channel_username, 'post': post_id}
