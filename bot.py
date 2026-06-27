@@ -312,7 +312,36 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != ADMIN_ID:
         return
+    
     text = update.message.text.strip()
+    
+    # ===== КОМАНДЫ УПРАВЛЕНИЯ (РАБОТАЮТ ВСЕГДА) =====
+    if text.startswith('/delete_'):
+        try:
+            acc_id = int(text.split('_')[1])
+            cursor.execute('DELETE FROM accounts WHERE id = ?', (acc_id,))
+            conn.commit()
+            await update.message.reply_text(f"✅ Аккаунт с ID {acc_id} удалён!")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка: {e}")
+        return
+    
+    if text.startswith('/toggle_'):
+        try:
+            acc_id = int(text.split('_')[1])
+            cursor.execute('SELECT status_info FROM accounts WHERE id = ?', (acc_id,))
+            row = cursor.fetchone()
+            if row:
+                new_status = "Отключен" if row[0] == "Активен" else "Активен"
+                cursor.execute('UPDATE accounts SET status_info = ? WHERE id = ?', (new_status, acc_id))
+                conn.commit()
+                await update.message.reply_text(f"✅ Аккаунт {acc_id} — теперь {new_status}!")
+            else:
+                await update.message.reply_text("❌ Аккаунт не найден!")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка: {e}")
+        return
+    
     state = user_states.get(user_id, {})
     
     if state.get('step') == 'waiting_reaction_link':
@@ -337,33 +366,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await select_accounts(update, context, 'abuse', link)
         return
-    
-    # ===== КОМАНДЫ УПРАВЛЕНИЯ =====
-    if text.startswith('/delete_'):
-        try:
-            acc_id = int(text.split('_')[1])
-            cursor.execute('DELETE FROM accounts WHERE id = ?', (acc_id,))
-            conn.commit()
-            await update.message.reply_text(f"✅ Аккаунт с ID {acc_id} удалён!")
-        except:
-            await update.message.reply_text("❌ Неверный ID!")
-        return
-    
-    if text.startswith('/toggle_'):
-        try:
-            acc_id = int(text.split('_')[1])
-            cursor.execute('SELECT status_info FROM accounts WHERE id = ?', (acc_id,))
-            row = cursor.fetchone()
-            if row:
-                new_status = "Отключен" if row[0] == "Активен" else "Активен"
-                cursor.execute('UPDATE accounts SET status_info = ? WHERE id = ?', (new_status, acc_id))
-                conn.commit()
-                await update.message.reply_text(f"✅ Аккаунт {acc_id} — теперь {new_status}!")
-            else:
-                await update.message.reply_text("❌ Аккаунт не найден!")
-        except:
-            await update.message.reply_text("❌ Неверный ID!")
-        return
 
 # ===== КНОПКИ =====
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -377,6 +379,44 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     state = user_states.get(user_id, {})
     
+    # ===== ПАГИНАЦИЯ =====
+    if data.startswith('page_'):
+        page = int(data.split('_')[1])
+        user_states[user_id] = {'page': page}
+        accounts = get_accounts()
+        if not accounts:
+            await query.edit_message_text("📋 Список пуст")
+            return
+        
+        per_page = 5
+        total_pages = (len(accounts) + per_page - 1) // per_page
+        start_idx = page * per_page
+        end_idx = start_idx + per_page
+        page_accounts = accounts[start_idx:end_idx]
+        
+        text = f"📋 **Аккаунты (страница {page + 1} из {total_pages}):**\n\n"
+        for acc in page_accounts:
+            acc_id, phone, session_path, status, name, status_info, created_at = acc
+            emoji = "🟢" if status_info == "Активен" else "🔴"
+            text += f"{emoji} `{phone}` — {status_info}\n"
+            text += f"   🆔 ID: {acc_id}\n"
+            text += f"   /delete_{acc_id} — удалить\n"
+            text += f"   /toggle_{acc_id} — включить/отключить\n\n"
+        
+        keyboard = []
+        nav_buttons = []
+        if page > 0:
+            nav_buttons.append(InlineKeyboardButton("◀️ Назад", callback_data=f"page_{page - 1}"))
+        if page < total_pages - 1:
+            nav_buttons.append(InlineKeyboardButton("Вперёд ▶️", callback_data=f"page_{page + 1}"))
+        
+        if nav_buttons:
+            keyboard.append(nav_buttons)
+        
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+    
+    # ===== ВЫБОР АККАУНТОВ =====
     if data.startswith('select_'):
         acc_id = int(data.split('_')[1])
         if acc_id in state.get('selected', []):
@@ -464,7 +504,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("📋 Список пуст")
             return
         
-        # Пагинация
         page = state.get('page', 0)
         per_page = 5
         total_pages = (len(accounts) + per_page - 1) // per_page
@@ -492,14 +531,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             keyboard.append(nav_buttons)
         
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
-        return
-    
-    # ===== ПАГИНАЦИЯ =====
-    if data.startswith('page_'):
-        page = int(data.split('_')[1])
-        user_states[user_id] = {'page': page}
-        # Перезапускаем full_list
-        await full_list(update, context)
         return
     
     # ===== ДРУГИЕ КНОПКИ =====
@@ -534,43 +565,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("🚀 Отправь ссылку TApp:\n`https://t.me/bot/app?startapp=ref`", parse_mode="Markdown")
         user_states[query.from_user.id] = {'step': 'waiting_link'}
         return
-
-async def full_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Вспомогательная функция для обновления списка"""
-    user_id = update.effective_user.id
-    accounts = get_accounts()
-    if not accounts:
-        await update.message.reply_text("📋 Список пуст")
-        return
-    
-    state = user_states.get(user_id, {})
-    page = state.get('page', 0)
-    per_page = 5
-    total_pages = (len(accounts) + per_page - 1) // per_page
-    start_idx = page * per_page
-    end_idx = start_idx + per_page
-    page_accounts = accounts[start_idx:end_idx]
-    
-    text = f"📋 **Аккаунты (страница {page + 1} из {total_pages}):**\n\n"
-    for acc in page_accounts:
-        acc_id, phone, session_path, status, name, status_info, created_at = acc
-        emoji = "🟢" if status_info == "Активен" else "🔴"
-        text += f"{emoji} `{phone}` — {status_info}\n"
-        text += f"   🆔 ID: {acc_id}\n"
-        text += f"   /delete_{acc_id} — удалить\n"
-        text += f"   /toggle_{acc_id} — включить/отключить\n\n"
-    
-    keyboard = []
-    nav_buttons = []
-    if page > 0:
-        nav_buttons.append(InlineKeyboardButton("◀️ Назад", callback_data=f"page_{page - 1}"))
-    if page < total_pages - 1:
-        nav_buttons.append(InlineKeyboardButton("Вперёд ▶️", callback_data=f"page_{page + 1}"))
-    
-    if nav_buttons:
-        keyboard.append(nav_buttons)
-    
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
 
 # ===== ЗАПУСК РЕАКЦИЙ =====
 async def run_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE, accounts, link, emoji):
