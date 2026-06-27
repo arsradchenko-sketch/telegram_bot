@@ -165,7 +165,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     await update.message.reply_text("👋 Выбери:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-# ===== ОБРАБОТКА ФАЙЛОВ (ZIP ИЛИ .SESSION) =====
+# ===== ОБРАБОТКА ФАЙЛОВ =====
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != ADMIN_ID:
@@ -179,7 +179,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Отправь файл!")
         return
     
-    # ===== ЕСЛИ ZIP =====
+    # ===== ZIP =====
     if document.file_name.endswith('.zip'):
         await update.message.reply_text("⏳ Загружаю и распаковываю архив...")
         try:
@@ -192,7 +192,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                 zip_ref.extractall(extract_path)
             
-            # Ищем папку sessions/
             sessions_path = None
             for root, dirs, files in os.walk(extract_path):
                 if "sessions" in dirs:
@@ -248,7 +247,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Ошибка: {e}")
         return
     
-    # ===== ЕСЛИ .SESSION =====
+    # ===== .SESSION =====
     if not document.file_name.endswith('.session'):
         await update.message.reply_text("❌ Отправь .session или ZIP!")
         return
@@ -399,22 +398,56 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ Выбор отменён.")
         return
     
+    # ===== НОВАЯ СТАТИСТИКА =====
     if query.data == "stats":
         accounts = get_accounts()
         if not accounts:
             await query.edit_message_text("📊 Аккаунтов пока нет")
             return
-        text = "📊 **Статистика аккаунтов:**\n\n"
+        
+        total = len(accounts)
+        active = sum(1 for acc in accounts if acc[5] == "Активен")
+        banned = sum(1 for acc in accounts if acc[5] == "Забанен")
+        error = sum(1 for acc in accounts if acc[5] == "Ошибка")
+        
+        text = f"📊 **Статистика фермы:**\n"
+        text += f"✅ Всего: {total} аккаунтов\n"
+        text += f"🟢 Активны: {active}\n"
+        text += f"🔴 Забанены: {banned}\n"
+        text += f"⚠️ Ошибок: {error}\n\n"
+        
+        # Показываем только 5 последних аккаунтов
+        text += "📱 **Последние 5 аккаунтов:**\n"
+        for acc in accounts[:5]:
+            acc_id, phone, session_path, status, name, status_info, created_at = acc
+            emoji = "🟢" if status_info == "Активен" else "🔴"
+            text += f"{emoji} `{phone}` — {status_info}\n"
+        
+        if total > 5:
+            text += f"\n📌 *Полный список — нажми «📋 Все аккаунты»*"
+        
+        keyboard = [[InlineKeyboardButton("📋 Все аккаунты", callback_data="full_list")]]
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+    
+    # ===== ПОЛНЫЙ СПИСОК =====
+    if query.data == "full_list":
+        accounts = get_accounts()
+        if not accounts:
+            await query.edit_message_text("📋 Список пуст")
+            return
+        
+        text = "📋 **Полный список аккаунтов:**\n\n"
         for acc in accounts:
             acc_id, phone, session_path, status, name, status_info, created_at = acc
-            text += f"📱 **{phone}**\n"
-            text += f"   • Имя: {name}\n"
-            text += f"   • Статус: {status_info}\n"
-            text += f"   • Добавлен: {created_at[:10]}\n\n"
+            emoji = "🟢" if status_info == "Активен" else "🔴"
+            text += f"{emoji} `{phone}` — {status_info}\n"
+        
         await query.edit_message_text(text, parse_mode="Markdown")
         return
     
-    elif query.data == "refresh":
+    # ===== ДРУГИЕ КНОПКИ =====
+    if query.data == "refresh":
         await query.edit_message_text("🔄 Обновляю статусы...")
         accounts = get_accounts()
         for acc in accounts:
