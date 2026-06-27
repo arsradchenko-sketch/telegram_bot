@@ -218,7 +218,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text = update.message.text.strip()
     
-    # ===== КОМАНДЫ УПРАВЛЕНИЯ (РАБОТАЮТ 100%) =====
+    # ===== КОМАНДЫ УПРАВЛЕНИЯ =====
     if text.startswith('/delete_'):
         try:
             acc_id = int(text.split('_')[1])
