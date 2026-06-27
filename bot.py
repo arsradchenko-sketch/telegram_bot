@@ -32,6 +32,8 @@ cursor.execute('''
         phone TEXT UNIQUE,
         session_path TEXT,
         status TEXT DEFAULT 'active',
+        name TEXT DEFAULT 'Неизвестно',
+        status_info TEXT DEFAULT '✅ Активен',
         created_at TEXT
     )
 ''')
@@ -47,10 +49,10 @@ cursor.execute('''
 ''')
 conn.commit()
 
-def add_account(phone, session_path):
+def add_account(phone, session_path, name="Неизвестно", status_info="✅ Активен"):
     try:
-        cursor.execute('INSERT INTO accounts (phone, session_path, created_at) VALUES (?, ?, ?)',
-                      (phone, session_path, datetime.now().isoformat()))
+        cursor.execute('INSERT INTO accounts (phone, session_path, name, status_info, created_at) VALUES (?, ?, ?, ?, ?)',
+                      (phone, session_path, name, status_info, datetime.now().isoformat()))
         conn.commit()
         return True
     except:
@@ -75,18 +77,14 @@ logging.basicConfig(level=logging.INFO)
 
 # ===== ПРОВЕРКА СТАТУСА АККАУНТА =====
 async def check_account_status(session_path):
-    """Проверяет, активен ли аккаунт и получает его имя"""
     try:
         client = TelegramClient(session_path, API_ID, API_HASH)
         await client.connect()
-        
         if not await client.is_user_authorized():
             return {'status': '❌ Забанен', 'name': 'Неизвестно'}
-        
         me = await client.get_me()
         await client.disconnect()
         return {'status': '✅ Активен', 'name': me.first_name or me.username or 'Без имени'}
-        
     except Exception as e:
         return {'status': f'❌ Ошибка: {str(e)[:30]}', 'name': 'Неизвестно'}
 
@@ -158,6 +156,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     keyboard = [
         [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
+        [InlineKeyboardButton("🔄 Обновить статусы", callback_data="refresh")],
         [InlineKeyboardButton("➕ Добавить аккаунт", callback_data="add")],
         [InlineKeyboardButton("📂 Загрузить сессию", callback_data="upload_session")],
         [InlineKeyboardButton("📋 Список", callback_data="list")],
@@ -228,15 +227,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await update.message.reply_text(f"🚀 Ставлю {emoji} на {len(accounts)} аккаунтах...")
         for acc in accounts:
-            phone = acc[1]
-            session_path = acc[2]
+            acc_id, phone, session_path, status, name, status_info, created_at = acc
             await update.message.reply_text(f"🔄 {phone}...")
             result = await set_reaction(session_path, link, emoji)
             if result['success']:
-                add_action(acc[0], 'reaction', link, 'success')
+                add_action(acc_id, 'reaction', link, 'success')
                 await update.message.reply_text(f"✅ {phone} — {result['emoji']}")
             else:
-                add_action(acc[0], 'reaction', link, 'error')
+                add_action(acc_id, 'reaction', link, 'error')
                 await update.message.reply_text(f"❌ {phone} — {result['error']}")
             await asyncio.sleep(3)
         await update.message.reply_text(f"✅ Готово!")
@@ -255,15 +253,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await update.message.reply_text(f"🚀 Запускаю абуз на {len(accounts)} аккаунтах...")
         for acc in accounts:
-            phone = acc[1]
-            session_path = acc[2]
+            acc_id, phone, session_path, status, name, status_info, created_at = acc
             await update.message.reply_text(f"🔄 {phone}...")
             result = await open_tapp(session_path, link)
             if result['success']:
-                add_action(acc[0], 'tapp', link, 'success')
+                add_action(acc_id, 'tapp', link, 'success')
                 await update.message.reply_text(f"✅ {phone} — успешно! @{result['bot']}")
             else:
-                add_action(acc[0], 'tapp', link, 'error')
+                add_action(acc_id, 'tapp', link, 'error')
                 await update.message.reply_text(f"❌ {phone} — {result['error']}")
             await asyncio.sleep(3)
         await update.message.reply_text(f"✅ Готово!")
@@ -321,24 +318,35 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if query.data == "stats":
         accounts = get_accounts()
-        total = get_stats()
-        
         if not accounts:
             await query.edit_message_text("📊 Аккаунтов пока нет")
             return
         
-        await query.edit_message_text("🔄 Проверяю статусы аккаунтов...")
-        
-        status_text = "📊 **Детальная статистика аккаунтов:**\n\n"
+        text = "📊 **Детальная статистика аккаунтов:**\n\n"
         for acc in accounts:
-            acc_id, phone, session_path, status, created_at = acc
-            check = await check_account_status(session_path)
-            status_text += f"📱 **{phone}**\n"
-            status_text += f"   • Имя: {check['name']}\n"
-            status_text += f"   • Статус: {check['status']}\n"
-            status_text += f"   • Добавлен: {created_at[:10]}\n\n"
+            acc_id, phone, session_path, status, name, status_info, created_at = acc
+            text += f"📱 **{phone}**\n"
+            text += f"   • Имя: {name}\n"
+            text += f"   • Статус: {status_info}\n"
+            text += f"   • Добавлен: {created_at[:10]}\n\n"
         
-        await query.edit_message_text(status_text, parse_mode="Markdown")
+        await query.edit_message_text(text, parse_mode="Markdown")
+    
+    elif query.data == "refresh":
+        await query.edit_message_text("🔄 Обновляю статусы всех аккаунтов...")
+        accounts = get_accounts()
+        if not accounts:
+            await query.edit_message_text("📊 Аккаунтов пока нет")
+            return
+        
+        for acc in accounts:
+            acc_id, phone, session_path, status, name, status_info, created_at = acc
+            check = await check_account_status(session_path)
+            cursor.execute('UPDATE accounts SET name = ?, status_info = ? WHERE id = ?', 
+                          (check['name'], check['status'], acc_id))
+            conn.commit()
+        
+        await query.edit_message_text("✅ Статусы всех аккаунтов обновлены!")
     
     elif query.data == "add":
         await query.edit_message_text("📱 Отправь номер:\n`+71234567890`", parse_mode="Markdown")
@@ -360,7 +368,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         text = "📋 Аккаунты:\n"
         for acc in accounts:
-            text += f"📱 {acc[1]}\n"
+            acc_id, phone, session_path, status, name, status_info, created_at = acc
+            text += f"📱 {phone} — {name} ({status_info})\n"
         await query.edit_message_text(text)
     
     elif query.data == "reaction":
