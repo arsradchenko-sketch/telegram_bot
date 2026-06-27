@@ -10,14 +10,20 @@ from telethon import TelegramClient
 from telethon.tl.functions.messages import SendReactionRequest, RequestWebViewRequest
 from telethon.tl.types import ReactionEmoji
 
+# ==================================================
+# 🔥 ДАННЫЕ БЕРУТСЯ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ 🔥
+# ==================================================
 TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_ID = int(os.environ.get("ADMIN_ID"))
 API_ID = int(os.environ.get("API_ID"))
 API_HASH = os.environ.get("API_HASH")
+# ==================================================
 
+# ===== СОЗДАЁМ ПАПКИ ДЛЯ ХРАНЕНИЯ =====
 os.makedirs("data", exist_ok=True)
 os.makedirs("data/sessions", exist_ok=True)
 
+# ===== БАЗА ДАННЫХ =====
 conn = sqlite3.connect("data/accounts.db", check_same_thread=False)
 cursor = conn.cursor()
 cursor.execute('''
@@ -63,9 +69,28 @@ def add_action(account_id, action_type, target, status):
                   (account_id, action_type, target, status, datetime.now().isoformat()))
     conn.commit()
 
+# ===== СОСТОЯНИЯ =====
 user_states = {}
 logging.basicConfig(level=logging.INFO)
 
+# ===== ПРОВЕРКА СТАТУСА АККАУНТА =====
+async def check_account_status(session_path):
+    """Проверяет, активен ли аккаунт и получает его имя"""
+    try:
+        client = TelegramClient(session_path, API_ID, API_HASH)
+        await client.connect()
+        
+        if not await client.is_user_authorized():
+            return {'status': '❌ Забанен', 'name': 'Неизвестно'}
+        
+        me = await client.get_me()
+        await client.disconnect()
+        return {'status': '✅ Активен', 'name': me.first_name or me.username or 'Без имени'}
+        
+    except Exception as e:
+        return {'status': f'❌ Ошибка: {str(e)[:30]}', 'name': 'Неизвестно'}
+
+# ===== РЕАКЦИЯ НА ПОСТ =====
 async def set_reaction(session_path, link, emoji="🔥"):
     try:
         client = TelegramClient(session_path, API_ID, API_HASH)
@@ -95,6 +120,7 @@ async def set_reaction(session_path, link, emoji="🔥"):
     except Exception as e:
         return {'success': False, 'error': str(e)}
 
+# ===== АБУЗ TAPP =====
 async def open_tapp(session_path, link):
     try:
         client = TelegramClient(session_path, API_ID, API_HASH)
@@ -125,6 +151,7 @@ async def open_tapp(session_path, link):
     except Exception as e:
         return {'success': False, 'error': str(e)}
 
+# ===== КОМАНДА /start =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("❌ Доступ запрещен!")
@@ -139,6 +166,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     await update.message.reply_text("👋 Выбери:", reply_markup=InlineKeyboardMarkup(keyboard))
 
+# ===== ОБРАБОТКА ФАЙЛОВ (ЗАГРУЗКА СЕССИЙ) =====
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != ADMIN_ID:
@@ -173,6 +201,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
+# ===== ОБРАБОТКА ТЕКСТА =====
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != ADMIN_ID:
@@ -282,6 +311,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Неверный пароль: {e}")
         return
 
+# ===== ОБРАБОТКА КНОПОК =====
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if query.from_user.id != ADMIN_ID:
@@ -292,7 +322,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "stats":
         accounts = get_accounts()
         total = get_stats()
-        await query.edit_message_text(f"📊 Всего аккаунтов: {total}\n✅ Активных: {len(accounts)}")
+        
+        if not accounts:
+            await query.edit_message_text("📊 Аккаунтов пока нет")
+            return
+        
+        await query.edit_message_text("🔄 Проверяю статусы аккаунтов...")
+        
+        status_text = "📊 **Детальная статистика аккаунтов:**\n\n"
+        for acc in accounts:
+            acc_id, phone, session_path, status, created_at = acc
+            check = await check_account_status(session_path)
+            status_text += f"📱 **{phone}**\n"
+            status_text += f"   • Имя: {check['name']}\n"
+            status_text += f"   • Статус: {check['status']}\n"
+            status_text += f"   • Добавлен: {created_at[:10]}\n\n"
+        
+        await query.edit_message_text(status_text, parse_mode="Markdown")
     
     elif query.data == "add":
         await query.edit_message_text("📱 Отправь номер:\n`+71234567890`", parse_mode="Markdown")
@@ -325,6 +371,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("🚀 Отправь ссылку TApp:\n`https://t.me/bot/app?startapp=ref`", parse_mode="Markdown")
         user_states[query.from_user.id] = {'step': 'waiting_link'}
 
+# ===== ЗАПУСК =====
 if __name__ == "__main__":
     print("🚀 БОТ ЗАПУЩЕН!")
     app = Application.builder().token(TOKEN).build()
