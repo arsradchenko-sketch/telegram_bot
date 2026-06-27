@@ -163,7 +163,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     await update.message.reply_text("👋 Выбери:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-# ===== ОБРАБОТКА ФАЙЛОВ =====
+# ===== ОБРАБОТКА ФАЙЛОВ (ПРИНИМАЕТ НЕСКОЛЬКО) =====
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != ADMIN_ID:
@@ -172,41 +172,96 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if state.get('step') != 'waiting_session_file':
         await update.message.reply_text("❌ Сначала нажми кнопку 'Загрузить сессию' в меню!")
         return
-    document = update.message.document
-    if not document:
-        await update.message.reply_text("❌ Отправь файл, а не текст!")
+    
+    # Получаем все файлы из сообщения (если их несколько)
+    documents = []
+    if update.message.document:
+        documents.append(update.message.document)
+    
+    if not documents:
+        await update.message.reply_text("❌ Отправь файл .session!")
         return
-    if not document.file_name.endswith('.session'):
-        await update.message.reply_text("❌ Файл должен иметь расширение `.session`")
+    
+    # Обрабатываем все файлы
+    added_count = 0
+    error_count = 0
+    report = []
+    
+    for doc in documents:
+        if not doc.file_name.endswith('.session'):
+            report.append(f"❌ {doc.file_name} — не .session файл")
+            error_count += 1
+            continue
+        
+        try:
+            file = await doc.get_file()
+            session_path = f"data/sessions/{doc.file_name}"
+            os.makedirs("data/sessions", exist_ok=True)
+            await file.download_to_drive(session_path)
+            
+            # Достаём номер из сессии
+            client = TelegramClient(session_path, API_ID, API_HASH)
+            await client.connect()
+            if await client.is_user_authorized():
+                me = await client.get_me()
+                phone = me.phone
+            else:
+                phone = doc.file_name.replace('.session', '')
+            await client.disconnect()
+            
+            if not phone.startswith('+'):
+                phone = '+' + phone
+            
+            # Добавляем в базу
+            cursor.execute('INSERT INTO accounts (phone, session_path, created_at) VALUES (?, ?, ?)',
+                          (phone, session_path, datetime.now().isoformat()))
+            conn.commit()
+            report.append(f"✅ {phone} — добавлен")
+            added_count += 1
+            
+        except sqlite3.IntegrityError:
+            report.append(f"❌ {doc.file_name} — уже существует в базе")
+            error_count += 1
+        except Exception as e:
+            report.append(f"❌ {doc.file_name} — ошибка: {e}")
+            error_count += 1
+    
+    # Отчёт
+    result_text = f"📊 **Результат загрузки:**\n\n"
+    result_text += f"✅ Добавлено: {added_count}\n"
+    result_text += f"❌ Ошибок: {error_count}\n\n"
+    result_text += "Детали:\n" + "\n".join(report[:15])
+    if len(report) > 15:
+        result_text += f"\n... и еще {len(report) - 15} файлов"
+    
+    await update.message.reply_text(result_text, parse_mode="Markdown")
+    del user_states[user_id]
+
+# ===== ВЫБОР АККАУНТОВ =====
+async def select_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE, action_type: str, link: str = None, emoji: str = None):
+    accounts = get_accounts()
+    if not accounts:
+        await update.message.reply_text("❌ Нет активных аккаунтов!")
         return
-    await update.message.reply_text("⏳ Загружаю файл на сервер...")
-    try:
-        file = await document.get_file()
-        session_path = f"data/sessions/{document.file_name}"
-        os.makedirs("data/sessions", exist_ok=True)
-        await file.download_to_drive(session_path)
-        
-        client = TelegramClient(session_path, API_ID, API_HASH)
-        await client.connect()
-        if await client.is_user_authorized():
-            me = await client.get_me()
-            phone = me.phone
-        else:
-            phone = document.file_name.replace('.session', '')
-        await client.disconnect()
-        
-        if not phone.startswith('+'):
-            phone = '+' + phone
-        
-        cursor.execute('INSERT INTO accounts (phone, session_path, created_at) VALUES (?, ?, ?)',
-                      (phone, session_path, datetime.now().isoformat()))
-        conn.commit()
-        await update.message.reply_text(f"✅ Аккаунт {phone} добавлен!")
-        del user_states[user_id]
-    except sqlite3.IntegrityError:
-        await update.message.reply_text(f"❌ Аккаунт уже существует в базе!")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {e}")
+    
+    keyboard = []
+    for acc in accounts:
+        acc_id, phone, session_path, status, name, status_info, created_at = acc
+        keyboard.append([InlineKeyboardButton(f"☑️ {phone} — {name}", callback_data=f"select_{acc_id}")])
+    
+    keyboard.append([InlineKeyboardButton("✅ Продолжить с выбранными", callback_data=f"confirm_{action_type}")])
+    keyboard.append([InlineKeyboardButton("❌ Отменить", callback_data="cancel_selection")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("📱 **Выбери аккаунты для действия:**\n(нажимай на номера, чтобы отметить/снять)", parse_mode="Markdown", reply_markup=reply_markup)
+    
+    user_states[update.effective_user.id] = {
+        'step': 'selecting_accounts',
+        'action_type': action_type,
+        'link': link,
+        'emoji': emoji,
+        'selected': []
+    }
 
 # ===== ОБРАБОТКА ТЕКСТА =====
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -228,44 +283,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if state.get('step') == 'waiting_reaction_emoji':
         emoji = text.strip() if text.strip() else "🔥"
         link = state.get('link')
-        accounts = get_accounts()
-        if not accounts:
-            await update.message.reply_text("❌ Нет активных аккаунтов!")
-            del user_states[user_id]
-            return
-        
-        success_count = 0
-        error_count = 0
-        report = []
-        await update.message.reply_text(f"🚀 Ставлю {emoji} на {len(accounts)} аккаунтах...")
-        
-        for acc in accounts:
-            acc_id, phone, session_path, status, name, status_info, created_at = acc
-            await update.message.reply_text(f"🔄 {phone}...")
-            result = await set_reaction(session_path, link, emoji)
-            
-            if result['success']:
-                success_count += 1
-                add_action(acc_id, 'reaction', link, 'success')
-                report.append(f"✅ {phone} — {result['emoji']}")
-            else:
-                error_count += 1
-                add_action(acc_id, 'reaction', link, 'error')
-                report.append(f"❌ {phone} — {result['error']}")
-            
-            await asyncio.sleep(3)
-        
-        total = success_count + error_count
-        report_text = f"📊 **Отчет по реакциям:**\n\n"
-        report_text += f"✅ Успешно: {success_count}\n"
-        report_text += f"❌ Ошибок: {error_count}\n"
-        report_text += f"📌 Всего: {total}\n\n"
-        report_text += "Детали:\n" + "\n".join(report[:10])
-        if len(report) > 10:
-            report_text += f"\n... и еще {len(report) - 10} аккаунтов"
-        
-        await update.message.reply_text(report_text, parse_mode="Markdown")
-        del user_states[user_id]
+        await select_accounts(update, context, 'reaction', link, emoji)
         return
     
     if state.get('step') == 'waiting_link':
@@ -273,53 +291,68 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if 't.me' not in link or 'startapp' not in link:
             await update.message.reply_text("❌ Неверная ссылка! Пример: https://t.me/notcoin_bot/app?startapp=ref123")
             return
-        accounts = get_accounts()
-        if not accounts:
-            await update.message.reply_text("❌ Нет активных аккаунтов!")
-            del user_states[user_id]
-            return
-        
-        success_count = 0
-        error_count = 0
-        report = []
-        await update.message.reply_text(f"🚀 Запускаю абуз на {len(accounts)} аккаунтах...")
-        
-        for acc in accounts:
-            acc_id, phone, session_path, status, name, status_info, created_at = acc
-            await update.message.reply_text(f"🔄 {phone}...")
-            result = await open_tapp(session_path, link)
-            
-            if result['success']:
-                success_count += 1
-                add_action(acc_id, 'tapp', link, 'success')
-                report.append(f"✅ {phone} — успешно! @{result['bot']}")
-            else:
-                error_count += 1
-                add_action(acc_id, 'tapp', link, 'error')
-                report.append(f"❌ {phone} — ошибка: {result['error']}")
-            
-            await asyncio.sleep(3)
-        
-        total = success_count + error_count
-        report_text = f"📊 **Отчет по абузу:**\n\n"
-        report_text += f"✅ Успешно: {success_count}\n"
-        report_text += f"❌ Ошибок: {error_count}\n"
-        report_text += f"📌 Всего: {total}\n\n"
-        report_text += "Детали:\n" + "\n".join(report[:10])
-        if len(report) > 10:
-            report_text += f"\n... и еще {len(report) - 10} аккаунтов"
-        
-        await update.message.reply_text(report_text, parse_mode="Markdown")
-        del user_states[user_id]
+        await select_accounts(update, context, 'abuse', link)
         return
 
-# ===== КНОПКИ =====
+# ===== ОБРАБОТКА КНОПОК =====
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if query.from_user.id != ADMIN_ID:
+    user_id = query.from_user.id
+    if user_id != ADMIN_ID:
         await query.answer("Доступ запрещен!", show_alert=True)
         return
     await query.answer()
+    
+    data = query.data
+    state = user_states.get(user_id, {})
+    
+    if data.startswith('select_'):
+        acc_id = int(data.split('_')[1])
+        if acc_id in state.get('selected', []):
+            state['selected'].remove(acc_id)
+        else:
+            state['selected'].append(acc_id)
+        user_states[user_id] = state
+        
+        accounts = get_accounts()
+        keyboard = []
+        for acc in accounts:
+            acc_id_db, phone, session_path, status, name, status_info, created_at = acc
+            if acc_id_db in state['selected']:
+                keyboard.append([InlineKeyboardButton(f"✅ {phone} — {name}", callback_data=f"select_{acc_id_db}")])
+            else:
+                keyboard.append([InlineKeyboardButton(f"☑️ {phone} — {name}", callback_data=f"select_{acc_id_db}")])
+        keyboard.append([InlineKeyboardButton("✅ Продолжить с выбранными", callback_data=f"confirm_{state['action_type']}")])
+        keyboard.append([InlineKeyboardButton("❌ Отменить", callback_data="cancel_selection")])
+        
+        await query.edit_message_text("📱 **Выбери аккаунты для действия:**\n(нажимай на номера, чтобы отметить/снять)", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+    
+    if data.startswith('confirm_'):
+        action_type = data.split('_')[1]
+        selected = state.get('selected', [])
+        if not selected:
+            await query.edit_message_text("❌ Ты не выбрал ни одного аккаунта!")
+            return
+        accounts = get_accounts()
+        selected_accounts = [acc for acc in accounts if acc[0] in selected]
+        await query.edit_message_text(f"🚀 Запускаю на {len(selected_accounts)} выбранных аккаунтах...")
+        
+        if action_type == 'reaction':
+            emoji = state.get('emoji', '🔥')
+            link = state.get('link')
+            await run_reaction(update, context, selected_accounts, link, emoji)
+        elif action_type == 'abuse':
+            link = state.get('link')
+            await run_abuse(update, context, selected_accounts, link)
+        
+        del user_states[user_id]
+        return
+    
+    if data == "cancel_selection":
+        del user_states[user_id]
+        await query.edit_message_text("❌ Выбор отменён.")
+        return
     
     if query.data == "stats":
         accounts = get_accounts()
@@ -334,6 +367,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text += f"   • Статус: {status_info}\n"
             text += f"   • Добавлен: {created_at[:10]}\n\n"
         await query.edit_message_text(text, parse_mode="Markdown")
+        return
     
     elif query.data == "refresh":
         await query.edit_message_text("🔄 Обновляю статусы...")
@@ -345,23 +379,93 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                           (check['name'], check['status'], acc_id))
             conn.commit()
         await query.edit_message_text("✅ Статусы обновлены!")
+        return
     
     elif query.data == "upload_session":
         await query.edit_message_text(
             "📂 **Загрузка сессии**\n\n"
-            "Отправь файл сессии (с расширением `.session`).\n"
-            "Бот сам определит номер телефона.",
+            "Отправь один или несколько файлов `.session`.\n"
+            "Бот добавит все аккаунты автоматически.",
             parse_mode="Markdown"
         )
         user_states[query.from_user.id] = {'step': 'waiting_session_file'}
+        return
     
     elif query.data == "reaction":
         await query.edit_message_text("🔥 Отправь ссылку на пост:\n`https://t.me/durov/123`", parse_mode="Markdown")
         user_states[query.from_user.id] = {'step': 'waiting_reaction_link'}
+        return
     
     elif query.data == "abuse":
         await query.edit_message_text("🚀 Отправь ссылку TApp:\n`https://t.me/bot/app?startapp=ref`", parse_mode="Markdown")
         user_states[query.from_user.id] = {'step': 'waiting_link'}
+        return
+
+# ===== ЗАПУСК РЕАКЦИЙ =====
+async def run_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE, accounts, link, emoji):
+    success_count = 0
+    error_count = 0
+    report = []
+    
+    for acc in accounts:
+        acc_id, phone, session_path, status, name, status_info, created_at = acc
+        await context.bot.send_message(chat_id=update.effective_user.id, text=f"🔄 {phone}...")
+        result = await set_reaction(session_path, link, emoji)
+        
+        if result['success']:
+            success_count += 1
+            add_action(acc_id, 'reaction', link, 'success')
+            report.append(f"✅ {phone} — {result['emoji']}")
+        else:
+            error_count += 1
+            add_action(acc_id, 'reaction', link, 'error')
+            report.append(f"❌ {phone} — {result['error']}")
+        
+        await asyncio.sleep(3)
+    
+    total = success_count + error_count
+    report_text = f"📊 **Отчет по реакциям:**\n\n"
+    report_text += f"✅ Успешно: {success_count}\n"
+    report_text += f"❌ Ошибок: {error_count}\n"
+    report_text += f"📌 Всего: {total}\n\n"
+    report_text += "Детали:\n" + "\n".join(report[:10])
+    if len(report) > 10:
+        report_text += f"\n... и еще {len(report) - 10} аккаунтов"
+    
+    await context.bot.send_message(chat_id=update.effective_user.id, text=report_text, parse_mode="Markdown")
+
+# ===== ЗАПУСК АБУЗА =====
+async def run_abuse(update: Update, context: ContextTypes.DEFAULT_TYPE, accounts, link):
+    success_count = 0
+    error_count = 0
+    report = []
+    
+    for acc in accounts:
+        acc_id, phone, session_path, status, name, status_info, created_at = acc
+        await context.bot.send_message(chat_id=update.effective_user.id, text=f"🔄 {phone}...")
+        result = await open_tapp(session_path, link)
+        
+        if result['success']:
+            success_count += 1
+            add_action(acc_id, 'tapp', link, 'success')
+            report.append(f"✅ {phone} — успешно! @{result['bot']}")
+        else:
+            error_count += 1
+            add_action(acc_id, 'tapp', link, 'error')
+            report.append(f"❌ {phone} — ошибка: {result['error']}")
+        
+        await asyncio.sleep(3)
+    
+    total = success_count + error_count
+    report_text = f"📊 **Отчет по абузу:**\n\n"
+    report_text += f"✅ Успешно: {success_count}\n"
+    report_text += f"❌ Ошибок: {error_count}\n"
+    report_text += f"📌 Всего: {total}\n\n"
+    report_text += "Детали:\n" + "\n".join(report[:10])
+    if len(report) > 10:
+        report_text += f"\n... и еще {len(report) - 10} аккаунтов"
+    
+    await context.bot.send_message(chat_id=update.effective_user.id, text=report_text, parse_mode="Markdown")
 
 # ===== ЗАПУСК =====
 if __name__ == "__main__":
