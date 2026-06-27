@@ -157,9 +157,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
         [InlineKeyboardButton("🔄 Обновить статусы", callback_data="refresh")],
-        [InlineKeyboardButton("➕ Добавить аккаунт", callback_data="add")],
         [InlineKeyboardButton("📂 Загрузить сессию", callback_data="upload_session")],
-        [InlineKeyboardButton("📋 Список", callback_data="list")],
         [InlineKeyboardButton("🔥 Реакции", callback_data="reaction")],
         [InlineKeyboardButton("🚀 Абуз TApp", callback_data="abuse")],
     ]
@@ -188,7 +186,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         os.makedirs("data/sessions", exist_ok=True)
         await file.download_to_drive(session_path)
         
-        # ===== САМОЕ ВАЖНОЕ: ДОСТАЁМ НОМЕР ИЗ СЕССИИ =====
         client = TelegramClient(session_path, API_ID, API_HASH)
         await client.connect()
         if await client.is_user_authorized():
@@ -277,47 +274,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Готово!")
         del user_states[user_id]
         return
-    
-    if state.get('step') == 'waiting_phone':
-        if not text.startswith('+') or not text[1:].isdigit():
-            await update.message.reply_text("❌ Формат: +71234567890")
-            return
-        try:
-            session_path = f"data/sessions/{text}.session"
-            client = TelegramClient(session_path, API_ID, API_HASH)
-            await client.connect()
-            await client.send_code_request(text)
-            user_states[user_id] = {'step': 'waiting_code', 'phone': text, 'client': client, 'session_path': session_path}
-            await update.message.reply_text(f"📱 Код на {text}\nВведи код:")
-        except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка: {e}")
-        return
-    
-    if state.get('step') == 'waiting_code':
-        try:
-            await state['client'].sign_in(state['phone'], text)
-            add_account(state['phone'], state['session_path'])
-            await update.message.reply_text(f"✅ Аккаунт {state['phone']} добавлен!")
-            await state['client'].disconnect()
-            del user_states[user_id]
-        except Exception as e:
-            if "password" in str(e).lower():
-                user_states[user_id]['step'] = 'waiting_password'
-                await update.message.reply_text("🔑 Введи пароль 2FA:")
-            else:
-                await update.message.reply_text(f"❌ Ошибка: {e}")
-        return
-    
-    if state.get('step') == 'waiting_password':
-        try:
-            await state['client'].sign_in(password=text)
-            add_account(state['phone'], state['session_path'])
-            await update.message.reply_text(f"✅ Аккаунт {state['phone']} добавлен!")
-            await state['client'].disconnect()
-            del user_states[user_id]
-        except Exception as e:
-            await update.message.reply_text(f"❌ Неверный пароль: {e}")
-        return
 
 # ===== КНОПКИ =====
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -352,10 +308,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.commit()
         await query.edit_message_text("✅ Статусы обновлены!")
     
-    elif query.data == "add":
-        await query.edit_message_text("📱 Отправь номер:\n`+71234567890`", parse_mode="Markdown")
-        user_states[query.from_user.id] = {'step': 'waiting_phone'}
-    
     elif query.data == "upload_session":
         await query.edit_message_text(
             "📂 **Загрузка сессии**\n\n"
@@ -364,17 +316,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
         user_states[query.from_user.id] = {'step': 'waiting_session_file'}
-    
-    elif query.data == "list":
-        accounts = get_accounts()
-        if not accounts:
-            await query.edit_message_text("📋 Список пуст")
-            return
-        text = "📋 Аккаунты:\n"
-        for acc in accounts:
-            acc_id, phone, session_path, status, name, status_info, created_at = acc
-            text += f"📱 {phone} — {name} ({status_info})\n"
-        await query.edit_message_text(text)
     
     elif query.data == "reaction":
         await query.edit_message_text("🔥 Отправь ссылку на пост:\n`https://t.me/durov/123`", parse_mode="Markdown")
