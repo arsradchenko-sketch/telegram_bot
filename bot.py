@@ -10,20 +10,14 @@ from telethon import TelegramClient
 from telethon.tl.functions.messages import SendReactionRequest, RequestWebViewRequest
 from telethon.tl.types import ReactionEmoji
 
-# ==================================================
-# 🔥 ДАННЫЕ БЕРУТСЯ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ 🔥
-# ==================================================
 TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_ID = int(os.environ.get("ADMIN_ID"))
 API_ID = int(os.environ.get("API_ID"))
 API_HASH = os.environ.get("API_HASH")
-# ==================================================
 
-# ===== СОЗДАЁМ ПАПКИ ДЛЯ ХРАНЕНИЯ =====
 os.makedirs("data", exist_ok=True)
 os.makedirs("data/sessions", exist_ok=True)
 
-# ===== БАЗА ДАННЫХ =====
 conn = sqlite3.connect("data/accounts.db", check_same_thread=False)
 cursor = conn.cursor()
 cursor.execute('''
@@ -69,11 +63,9 @@ def add_action(account_id, action_type, target, status):
                   (account_id, action_type, target, status, datetime.now().isoformat()))
     conn.commit()
 
-# ===== СОСТОЯНИЯ =====
 user_states = {}
 logging.basicConfig(level=logging.INFO)
 
-# ===== РЕАКЦИЯ НА ПОСТ =====
 async def set_reaction(session_path, link, emoji="🔥"):
     try:
         client = TelegramClient(session_path, API_ID, API_HASH)
@@ -103,7 +95,6 @@ async def set_reaction(session_path, link, emoji="🔥"):
     except Exception as e:
         return {'success': False, 'error': str(e)}
 
-# ===== АБУЗ TAPP =====
 async def open_tapp(session_path, link):
     try:
         client = TelegramClient(session_path, API_ID, API_HASH)
@@ -134,7 +125,6 @@ async def open_tapp(session_path, link):
     except Exception as e:
         return {'success': False, 'error': str(e)}
 
-# ===== КОМАНДА /start =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("❌ Доступ запрещен!")
@@ -149,7 +139,40 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     await update.message.reply_text("👋 Выбери:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-# ===== ОБРАБОТКА ТЕКСТА =====
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
+        return
+    state = user_states.get(user_id, {})
+    if state.get('step') != 'waiting_session_file':
+        await update.message.reply_text("❌ Сначала нажми кнопку 'Загрузить сессию' в меню!")
+        return
+    document = update.message.document
+    if not document:
+        await update.message.reply_text("❌ Отправь файл, а не текст!")
+        return
+    if not document.file_name.endswith('.session'):
+        await update.message.reply_text("❌ Файл должен иметь расширение `.session`")
+        return
+    await update.message.reply_text("⏳ Загружаю файл на сервер...")
+    try:
+        file = await document.get_file()
+        session_path = f"data/sessions/{document.file_name}"
+        os.makedirs("data/sessions", exist_ok=True)
+        await file.download_to_drive(session_path)
+        phone = document.file_name.replace('.session', '')
+        if not phone.startswith('+'):
+            phone = '+' + phone
+        cursor.execute('INSERT INTO accounts (phone, session_path, created_at) VALUES (?, ?, ?)',
+                      (phone, session_path, datetime.now().isoformat()))
+        conn.commit()
+        await update.message.reply_text(f"✅ Аккаунт {phone} добавлен!")
+        del user_states[user_id]
+    except sqlite3.IntegrityError:
+        await update.message.reply_text(f"❌ Аккаунт уже существует в базе!")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != ADMIN_ID:
@@ -157,7 +180,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     state = user_states.get(user_id, {})
     
-    # === ЖДЕМ ССЫЛКУ ДЛЯ РЕАКЦИЙ ===
     if state.get('step') == 'waiting_reaction_link':
         link = text
         if 't.me' not in link or not re.search(r't\.me/[\w]+/\d+', link):
@@ -167,7 +189,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_states[user_id] = {'step': 'waiting_reaction_emoji', 'link': link}
         return
     
-    # === ЖДЕМ ЭМОДЗИ ===
     if state.get('step') == 'waiting_reaction_emoji':
         emoji = text.strip() if text.strip() else "🔥"
         link = state.get('link')
@@ -193,7 +214,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         del user_states[user_id]
         return
     
-    # === ЖДЕМ ССЫЛКУ ДЛЯ АБУЗА ===
     if state.get('step') == 'waiting_link':
         link = text
         if 't.me' not in link or 'startapp' not in link:
@@ -221,7 +241,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         del user_states[user_id]
         return
     
-    # === ЖДЕМ НОМЕР ===
     if state.get('step') == 'waiting_phone':
         if not text.startswith('+') or not text[1:].isdigit():
             await update.message.reply_text("❌ Формат: +71234567890")
@@ -237,7 +256,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Ошибка: {e}")
         return
     
-    # === ЖДЕМ КОД ===
     if state.get('step') == 'waiting_code':
         try:
             await state['client'].sign_in(state['phone'], text)
@@ -253,7 +271,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"❌ Ошибка: {e}")
         return
     
-    # === ЖДЕМ ПАРОЛЬ 2FA ===
     if state.get('step') == 'waiting_password':
         try:
             await state['client'].sign_in(password=text)
@@ -265,51 +282,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Неверный пароль: {e}")
         return
 
-# ===== ОБРАБОТКА ФАЙЛОВ (ЗАГРУЗКА СЕССИЙ) =====
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id != ADMIN_ID:
-        return
-    
-    state = user_states.get(user_id, {})
-    if state.get('step') != 'waiting_session_file':
-        await update.message.reply_text("❌ Сначала нажми кнопку 'Загрузить сессию' в меню!")
-        return
-    
-    document = update.message.document
-    if not document:
-        await update.message.reply_text("❌ Отправь файл, а не текст!")
-        return
-    
-    if not document.file_name.endswith('.session'):
-        await update.message.reply_text("❌ Файл должен иметь расширение `.session`")
-        return
-    
-    await update.message.reply_text("⏳ Загружаю файл на сервер...")
-    
-    try:
-        file = await document.get_file()
-        session_path = f"data/sessions/{document.file_name}"
-        os.makedirs("data/sessions", exist_ok=True)
-        await file.download_to_drive(session_path)
-        
-        phone = document.file_name.replace('.session', '')
-        if not phone.startswith('+'):
-            phone = '+' + phone
-        
-        cursor.execute('INSERT INTO accounts (phone, session_path, created_at) VALUES (?, ?, ?)',
-                      (phone, session_path, datetime.now().isoformat()))
-        conn.commit()
-        
-        await update.message.reply_text(f"✅ Аккаунт {phone} добавлен!\n📁 Файл: {session_path}")
-        del user_states[user_id]
-        
-    except sqlite3.IntegrityError:
-        await update.message.reply_text(f"❌ Аккаунт уже существует в базе!")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {e}")
-
-# ===== ОБРАБОТКА КНОПОК =====
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if query.from_user.id != ADMIN_ID:
@@ -330,8 +302,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "📂 **Загрузка сессии**\n\n"
             "Отправь файл сессии (с расширением `.session`).\n"
-            "Файл можно найти в папке Telegram Desktop: `tdata`\n\n"
-            "Или используй бота @session_importer для создания сессии.",
+            "Файл можно найти в папке Telegram Desktop: `tdata`",
             parse_mode="Markdown"
         )
         user_states[query.from_user.id] = {'step': 'waiting_session_file'}
@@ -354,7 +325,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("🚀 Отправь ссылку TApp:\n`https://t.me/bot/app?startapp=ref`", parse_mode="Markdown")
         user_states[query.from_user.id] = {'step': 'waiting_link'}
 
-# ===== ЗАПУСК =====
 if __name__ == "__main__":
     print("🚀 БОТ ЗАПУЩЕН!")
     app = Application.builder().token(TOKEN).build()
