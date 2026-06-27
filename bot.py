@@ -19,7 +19,7 @@ API_ID = int(os.environ.get("API_ID"))
 API_HASH = os.environ.get("API_HASH")
 # ==================================================
 
-# ===== СОЗДАЁМ ПАПКИ ДЛЯ ХРАНЕНИЯ =====
+# ===== СОЗДАЁМ ПАПКИ =====
 os.makedirs("data", exist_ok=True)
 os.makedirs("data/sessions", exist_ok=True)
 
@@ -33,7 +33,7 @@ cursor.execute('''
         session_path TEXT,
         status TEXT DEFAULT 'active',
         name TEXT DEFAULT 'Неизвестно',
-        status_info TEXT DEFAULT '✅ Активен',
+        status_info TEXT DEFAULT 'Активен',
         created_at TEXT
     )
 ''')
@@ -49,7 +49,7 @@ cursor.execute('''
 ''')
 conn.commit()
 
-def add_account(phone, session_path, name="Неизвестно", status_info="✅ Активен"):
+def add_account(phone, session_path, name="Неизвестно", status_info="Активен"):
     try:
         cursor.execute('INSERT INTO accounts (phone, session_path, name, status_info, created_at) VALUES (?, ?, ?, ?, ?)',
                       (phone, session_path, name, status_info, datetime.now().isoformat()))
@@ -75,7 +75,7 @@ def add_action(account_id, action_type, target, status):
 user_states = {}
 logging.basicConfig(level=logging.INFO)
 
-# ===== ПРОВЕРКА СТАТУСА АККАУНТА =====
+# ===== ПРОВЕРКА СТАТУСА =====
 async def check_account_status(session_path):
     try:
         client = TelegramClient(session_path, API_ID, API_HASH)
@@ -86,9 +86,9 @@ async def check_account_status(session_path):
         await client.disconnect()
         return {'status': '✅ Активен', 'name': me.first_name or me.username or 'Без имени'}
     except Exception as e:
-        return {'status': f'❌ Ошибка: {str(e)[:30]}', 'name': 'Неизвестно'}
+        return {'status': f'❌ Ошибка', 'name': 'Неизвестно'}
 
-# ===== РЕАКЦИЯ НА ПОСТ =====
+# ===== РЕАКЦИЯ =====
 async def set_reaction(session_path, link, emoji="🔥"):
     try:
         client = TelegramClient(session_path, API_ID, API_HASH)
@@ -165,7 +165,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     await update.message.reply_text("👋 Выбери:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-# ===== ОБРАБОТКА ФАЙЛОВ (ЗАГРУЗКА СЕССИЙ) =====
+# ===== ОБРАБОТКА ФАЙЛОВ =====
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != ADMIN_ID:
@@ -187,9 +187,20 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session_path = f"data/sessions/{document.file_name}"
         os.makedirs("data/sessions", exist_ok=True)
         await file.download_to_drive(session_path)
-        phone = document.file_name.replace('.session', '')
+        
+        # ===== САМОЕ ВАЖНОЕ: ДОСТАЁМ НОМЕР ИЗ СЕССИИ =====
+        client = TelegramClient(session_path, API_ID, API_HASH)
+        await client.connect()
+        if await client.is_user_authorized():
+            me = await client.get_me()
+            phone = me.phone
+        else:
+            phone = document.file_name.replace('.session', '')
+        await client.disconnect()
+        
         if not phone.startswith('+'):
             phone = '+' + phone
+        
         cursor.execute('INSERT INTO accounts (phone, session_path, created_at) VALUES (?, ?, ?)',
                       (phone, session_path, datetime.now().isoformat()))
         conn.commit()
@@ -308,7 +319,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Неверный пароль: {e}")
         return
 
-# ===== ОБРАБОТКА КНОПОК =====
+# ===== КНОПКИ =====
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if query.from_user.id != ADMIN_ID:
@@ -321,32 +332,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not accounts:
             await query.edit_message_text("📊 Аккаунтов пока нет")
             return
-        
-        text = "📊 **Детальная статистика аккаунтов:**\n\n"
+        text = "📊 **Статистика аккаунтов:**\n\n"
         for acc in accounts:
             acc_id, phone, session_path, status, name, status_info, created_at = acc
             text += f"📱 **{phone}**\n"
             text += f"   • Имя: {name}\n"
             text += f"   • Статус: {status_info}\n"
             text += f"   • Добавлен: {created_at[:10]}\n\n"
-        
         await query.edit_message_text(text, parse_mode="Markdown")
     
     elif query.data == "refresh":
-        await query.edit_message_text("🔄 Обновляю статусы всех аккаунтов...")
+        await query.edit_message_text("🔄 Обновляю статусы...")
         accounts = get_accounts()
-        if not accounts:
-            await query.edit_message_text("📊 Аккаунтов пока нет")
-            return
-        
         for acc in accounts:
             acc_id, phone, session_path, status, name, status_info, created_at = acc
             check = await check_account_status(session_path)
             cursor.execute('UPDATE accounts SET name = ?, status_info = ? WHERE id = ?', 
                           (check['name'], check['status'], acc_id))
             conn.commit()
-        
-        await query.edit_message_text("✅ Статусы всех аккаунтов обновлены!")
+        await query.edit_message_text("✅ Статусы обновлены!")
     
     elif query.data == "add":
         await query.edit_message_text("📱 Отправь номер:\n`+71234567890`", parse_mode="Markdown")
@@ -356,7 +360,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "📂 **Загрузка сессии**\n\n"
             "Отправь файл сессии (с расширением `.session`).\n"
-            "Файл можно найти в папке Telegram Desktop: `tdata`",
+            "Бот сам определит номер телефона.",
             parse_mode="Markdown"
         )
         user_states[query.from_user.id] = {'step': 'waiting_session_file'}
