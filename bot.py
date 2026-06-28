@@ -214,7 +214,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text = update.message.text.strip()
     
-    # ===== ЭТО РАБОТАЕТ 100% =====
+    # ===== КОМАНДЫ =====
     if text == "/test":
         await update.message.reply_text("✅ Бот работает, команды принимает!")
         return
