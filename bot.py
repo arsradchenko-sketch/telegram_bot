@@ -214,25 +214,29 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text = update.message.text.strip()
     
-    # ===== КОМАНДЫ УПРАВЛЕНИЯ =====
-    if text.startswith('/delete_'):
+    # ===== ЭТО РАБОТАЕТ 100% =====
+    if text == "/test":
+        await update.message.reply_text("✅ Бот работает, команды принимает!")
+        return
+    
+    if text.startswith("/delete_"):
         try:
-            acc_id = int(text.split('_')[1])
-            cursor.execute('DELETE FROM accounts WHERE id = ?', (acc_id,))
+            acc_id = int(text.split("_")[1])
+            cursor.execute("DELETE FROM accounts WHERE id = ?", (acc_id,))
             conn.commit()
-            await update.message.reply_text(f"✅ Аккаунт с ID {acc_id} удалён!")
+            await update.message.reply_text(f"✅ Аккаунт {acc_id} удалён!")
         except Exception as e:
             await update.message.reply_text(f"❌ Ошибка: {e}")
         return
     
-    if text.startswith('/toggle_'):
+    if text.startswith("/toggle_"):
         try:
-            acc_id = int(text.split('_')[1])
-            cursor.execute('SELECT status_info FROM accounts WHERE id = ?', (acc_id,))
+            acc_id = int(text.split("_")[1])
+            cursor.execute("SELECT status_info FROM accounts WHERE id = ?", (acc_id,))
             row = cursor.fetchone()
             if row:
                 new_status = "Отключен" if row[0] == "Активен" else "Активен"
-                cursor.execute('UPDATE accounts SET status_info = ? WHERE id = ?', (new_status, acc_id))
+                cursor.execute("UPDATE accounts SET status_info = ? WHERE id = ?", (new_status, acc_id))
                 conn.commit()
                 await update.message.reply_text(f"✅ Аккаунт {acc_id} — теперь {new_status}!")
             else:
