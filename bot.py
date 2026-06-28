@@ -48,10 +48,6 @@ def get_accounts():
     cursor.execute('SELECT * FROM accounts WHERE status = "active"')
     return cursor.fetchall()
 
-def get_stats():
-    total = cursor.execute('SELECT COUNT(*) FROM accounts').fetchone()[0]
-    return total
-
 user_states = {}
 logging.basicConfig(level=logging.INFO)
 
