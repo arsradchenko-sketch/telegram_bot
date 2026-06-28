@@ -213,39 +213,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id != ADMIN_ID:
         return
     text = update.message.text.strip()
-    
-    # ===== КОМАНДЫ =====
-    if text == "/test":
-        await update.message.reply_text("✅ Бот работает, команды принимает!")
-        return
-    
-    if text.startswith("/delete_"):
-        try:
-            acc_id = int(text.split("_")[1])
-            cursor.execute("DELETE FROM accounts WHERE id = ?", (acc_id,))
-            conn.commit()
-            await update.message.reply_text(f"✅ Аккаунт {acc_id} удалён!")
-        except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка: {e}")
-        return
-    
-    if text.startswith("/toggle_"):
-        try:
-            acc_id = int(text.split("_")[1])
-            cursor.execute("SELECT status_info FROM accounts WHERE id = ?", (acc_id,))
-            row = cursor.fetchone()
-            if row:
-                new_status = "Отключен" if row[0] == "Активен" else "Активен"
-                cursor.execute("UPDATE accounts SET status_info = ? WHERE id = ?", (new_status, acc_id))
-                conn.commit()
-                await update.message.reply_text(f"✅ Аккаунт {acc_id} — теперь {new_status}!")
-            else:
-                await update.message.reply_text("❌ Аккаунт не найден!")
-        except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка: {e}")
-        return
-    
     state = user_states.get(user_id, {})
+    
     if state.get('step') == 'waiting_reaction_link':
         link = text
         if 't.me' not in link or not re.search(r't\.me/[\w]+/\d+', link):
@@ -323,6 +292,27 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     state = user_states.get(user_id, {})
     
+    # ===== КНОПКИ УПРАВЛЕНИЯ АККАУНТАМИ =====
+    if data.startswith('delete_'):
+        acc_id = int(data.split('_')[1])
+        cursor.execute("DELETE FROM accounts WHERE id = ?", (acc_id,))
+        conn.commit()
+        await query.edit_message_text(f"✅ Аккаунт {acc_id} удалён!")
+        return
+    
+    if data.startswith('toggle_'):
+        acc_id = int(data.split('_')[1])
+        cursor.execute("SELECT status_info FROM accounts WHERE id = ?", (acc_id,))
+        row = cursor.fetchone()
+        if row:
+            new_status = "Отключен" if row[0] == "Активен" else "Активен"
+            cursor.execute("UPDATE accounts SET status_info = ? WHERE id = ?", (new_status, acc_id))
+            conn.commit()
+            await query.edit_message_text(f"✅ Аккаунт {acc_id} — теперь {new_status}!")
+        else:
+            await query.edit_message_text("❌ Аккаунт не найден!")
+        return
+    
     if data.startswith('page_'):
         page = int(data.split('_')[1])
         user_states[user_id] = {'page': page}
@@ -341,8 +331,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             emoji = "🟢" if status_info == "Активен" else "🔴"
             text += f"{emoji} `{phone}` — {status_info}\n"
             text += f"   🆔 ID: {acc_id}\n"
-            text += f"   /delete_{acc_id} — удалить\n"
-            text += f"   /toggle_{acc_id} — включить/отключить\n\n"
+            text += f"   🗑️ /delete_{acc_id} — удалить\n"
+            text += f"   ⛔ /toggle_{acc_id} — включить/отключить\n\n"
         keyboard = []
         nav_buttons = []
         if page > 0:
@@ -391,10 +381,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             acc_id, phone, session_path, status, name, status_info, created_at = acc
             emoji = "🟢" if status_info == "Активен" else "🔴"
             text += f"{emoji} `{phone}` — {status_info}\n"
-            text += f"   🆔 ID: {acc_id}\n"
-            text += f"   /delete_{acc_id} — удалить\n"
-            text += f"   /toggle_{acc_id} — включить/отключить\n\n"
+            text += f"   🆔 ID: {acc_id}\n\n"
         keyboard = []
+        for acc in page_accounts:
+            acc_id = acc[0]
+            keyboard.append([
+                InlineKeyboardButton(f"🗑️ Удалить {acc_id}", callback_data=f"delete_{acc_id}"),
+                InlineKeyboardButton(f"⛔ Отключить {acc_id}", callback_data=f"toggle_{acc_id}")
+            ])
         nav_buttons = []
         if page > 0:
             nav_buttons.append(InlineKeyboardButton("◀️ Назад", callback_data=f"page_{page - 1}"))
