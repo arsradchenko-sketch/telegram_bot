@@ -11,7 +11,10 @@ import shutil
 import random
 from datetime import datetime
 from telethon import TelegramClient
-from telethon.tl.functions.messages import SendReactionRequest, GetMessagesViewsRequest, RequestWebViewRequest
+from telethon.tl.functions.messages import (
+    SendReactionRequest, GetMessagesViewsRequest,
+    RequestWebViewRequest, GetBotCallbackAnswerRequest
+)
 from telethon.tl.types import ReactionEmoji
 from urllib.parse import urlparse, parse_qs
 
@@ -23,7 +26,7 @@ ADMIN_ID = int(os.environ.get("ADMIN_ID"))
 API_ID   = int(os.environ.get("API_ID"))
 API_HASH = os.environ.get("API_HASH")
 
-TELETHON_TIMEOUT = 30  # секунд до таймаута на любой Telethon-запрос
+TELETHON_TIMEOUT = 30
 
 os.makedirs("data", exist_ok=True)
 os.makedirs("data/sessions", exist_ok=True)
@@ -46,7 +49,7 @@ file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(messa
 logger.addHandler(file_handler)
 
 # ───────────────────────────────────────────
-#  БАЗА ДАННЫХ (thread-safe через lock)
+#  БАЗА ДАННЫХ
 # ───────────────────────────────────────────
 db_lock = asyncio.Lock()
 conn   = sqlite3.connect("data/accounts.db", check_same_thread=False)
@@ -65,7 +68,6 @@ cursor.execute('''
 conn.commit()
 
 def db_execute(query, params=()):
-    """Безопасное выполнение запроса к БД."""
     try:
         cursor.execute(query, params)
         conn.commit()
@@ -87,20 +89,20 @@ def get_accounts():
 # ───────────────────────────────────────────
 #  СОСТОЯНИЯ И ЗАЩИТА ОТ ДВОЙНОГО ЗАПУСКА
 # ───────────────────────────────────────────
-user_states    = {}
-active_tasks   = set()   # user_id тех, у кого сейчас идёт задача
+user_states  = {}
+active_tasks = set()
 
 # ───────────────────────────────────────────
-#  ГЛАВНОЕ МЕНЮ  (добавлена кнопка «🔗 Рефка»)
+#  ГЛАВНОЕ МЕНЮ
 # ───────────────────────────────────────────
 MAIN_KEYBOARD = [
-    [InlineKeyboardButton("📊 Статистика",       callback_data="stats")],
-    [InlineKeyboardButton("🔄 Обновить статусы", callback_data="refresh")],
-    [InlineKeyboardButton("📂 Загрузить сессию", callback_data="upload_session")],
-    [InlineKeyboardButton("🔥 Реакции",          callback_data="reaction")],
-    [InlineKeyboardButton("🚀 Абуз TApp",        callback_data="abuse")],
-    [InlineKeyboardButton("🔗 Рефка (старт)",    callback_data="refka")],   # ← НОВАЯ КНОПКА
-    [InlineKeyboardButton("📤 Экспорт аккаунтов",callback_data="export")],
+    [InlineKeyboardButton("📊 Статистика",        callback_data="stats")],
+    [InlineKeyboardButton("🔄 Обновить статусы",  callback_data="refresh")],
+    [InlineKeyboardButton("📂 Загрузить сессию",  callback_data="upload_session")],
+    [InlineKeyboardButton("🔥 Реакции",           callback_data="reaction")],
+    [InlineKeyboardButton("🚀 Абуз TApp",         callback_data="abuse")],
+    [InlineKeyboardButton("🔗 Рефка (старт)",     callback_data="refka")],
+    [InlineKeyboardButton("📤 Экспорт аккаунтов", callback_data="export")],
 ]
 BACK_BUTTON = [[InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]]
 
@@ -109,7 +111,6 @@ BACK_BUTTON = [[InlineKeyboardButton("🏠 Главное меню", callback_da
 # ───────────────────────────────────────────
 
 def parse_reaction_input(text):
-    """'🔥3 ❤️2 ⚡2' → [(emoji, count), ...]"""
     text = text.replace(',', ' ').replace(';', ' ')
     pattern = r'([\U00010000-\U0010ffff][\ufe0f\u20e3]?|[\u2600-\u27BF][\ufe0f]?)\s*(\d+)'
     matches = re.findall(pattern, text)
@@ -121,29 +122,18 @@ def acc_emoji(status_info):
     return "🟢" if "Активен" in status_info else "🔴"
 
 async def safe_disconnect(client):
-    """Отключаемся от Telethon без исключений."""
     try:
         await client.disconnect()
     except Exception:
         pass
 
 def parse_refka_link(url: str):
-    """
-    Разбирает реферальную ссылку.
-    Возвращает (bot_username, link_type, ref_param).
-    link_type: 'start' | 'startapp'
-    Поддерживает:
-      https://t.me/username?start=ref
-      https://t.me/username/app?startapp=ref
-    """
     parsed = urlparse(url)
     qs = parse_qs(parsed.query)
     path_parts = parsed.path.strip("/").split("/")
     username = path_parts[0] if path_parts else ""
-
     if not username:
         raise ValueError("Не удалось определить username бота.")
-
     if "startapp" in qs:
         return username, "startapp", qs["startapp"][0]
     elif "start" in qs:
@@ -152,7 +142,7 @@ def parse_refka_link(url: str):
         raise ValueError("Не найден параметр ?start= или ?startapp= в ссылке.")
 
 # ───────────────────────────────────────────
-#  TELETHON-ФУНКЦИИ (с таймаутом и finally)
+#  TELETHON-ФУНКЦИИ
 # ───────────────────────────────────────────
 
 async def check_account_status(session_path):
@@ -163,19 +153,18 @@ async def check_account_status(session_path):
             return {'status': '❌ Забанен', 'name': 'Неизвестно'}
         me = await asyncio.wait_for(client.get_me(), timeout=TELETHON_TIMEOUT)
         name = me.first_name or me.username or 'Без имени'
-        logger.info(f"check_status OK: {session_path} → {name}")
+        logger.info(f"check_status OK: {session_path} -> {name}")
         return {'status': '✅ Активен', 'name': name}
     except asyncio.TimeoutError:
         logger.warning(f"check_status TIMEOUT: {session_path}")
         return {'status': '❌ Ошибка', 'name': 'Таймаут'}
     except Exception as e:
-        logger.warning(f"check_status ERROR: {session_path} → {e}")
+        logger.warning(f"check_status ERROR: {session_path} -> {e}")
         return {'status': '❌ Ошибка', 'name': 'Неизвестно'}
     finally:
         await safe_disconnect(client)
 
 async def view_post(session_path, channel_username, post_id):
-    """Засчитывает просмотр поста."""
     client = TelegramClient(session_path, API_ID, API_HASH)
     try:
         await asyncio.wait_for(client.connect(), timeout=TELETHON_TIMEOUT)
@@ -186,12 +175,12 @@ async def view_post(session_path, channel_username, post_id):
             client(GetMessagesViewsRequest(peer=entity, id=[post_id], increment=True)),
             timeout=TELETHON_TIMEOUT
         )
-        logger.info(f"view_post OK: {session_path} → @{channel_username}/{post_id}")
+        logger.info(f"view_post OK: {session_path} -> @{channel_username}/{post_id}")
         return {'success': True}
     except asyncio.TimeoutError:
         return {'success': False, 'error': 'Таймаут'}
     except Exception as e:
-        logger.warning(f"view_post ERROR: {session_path} → {e}")
+        logger.warning(f"view_post ERROR: {session_path} -> {e}")
         return {'success': False, 'error': str(e)}
     finally:
         await safe_disconnect(client)
@@ -212,12 +201,12 @@ async def set_reaction(session_path, link, emoji="🔥"):
             client(SendReactionRequest(peer=entity, msg_id=post_id, reaction=[ReactionEmoji(emoticon=emoji)])),
             timeout=TELETHON_TIMEOUT
         )
-        logger.info(f"set_reaction OK: {session_path} → {emoji} на {link}")
+        logger.info(f"set_reaction OK: {session_path} -> {emoji}")
         return {'success': True, 'emoji': emoji}
     except asyncio.TimeoutError:
         return {'success': False, 'error': 'Таймаут'}
     except Exception as e:
-        logger.warning(f"set_reaction ERROR: {session_path} → {e}")
+        logger.warning(f"set_reaction ERROR: {session_path} -> {e}")
         return {'success': False, 'error': str(e)}
     finally:
         await safe_disconnect(client)
@@ -243,22 +232,17 @@ async def open_tapp(session_path, link):
             )),
             timeout=TELETHON_TIMEOUT
         )
-        logger.info(f"open_tapp OK: {session_path} → @{bot_username}")
+        logger.info(f"open_tapp OK: {session_path} -> @{bot_username}")
         return {'success': True, 'url': webview.url, 'bot': bot_username}
     except asyncio.TimeoutError:
         return {'success': False, 'error': 'Таймаут'}
     except Exception as e:
-        logger.warning(f"open_tapp ERROR: {session_path} → {e}")
+        logger.warning(f"open_tapp ERROR: {session_path} -> {e}")
         return {'success': False, 'error': str(e)}
     finally:
         await safe_disconnect(client)
 
 async def do_refka(session_path, bot_username: str, link_type: str, ref_param: str):
-    """
-    Выполняет реферальный переход для одного аккаунта.
-    link_type='start'    → отправляет /start {ref_param}
-    link_type='startapp' → открывает WebApp через RequestWebViewRequest
-    """
     client = TelegramClient(session_path, API_ID, API_HASH)
     try:
         await asyncio.wait_for(client.connect(), timeout=TELETHON_TIMEOUT)
@@ -274,7 +258,7 @@ async def do_refka(session_path, bot_username: str, link_type: str, ref_param: s
                 client.send_message(entity, f"/start {ref_param}"),
                 timeout=TELETHON_TIMEOUT
             )
-            logger.info(f"[Refka] do_refka OK (start): {session_path} → @{bot_username} ref={ref_param}")
+            logger.info(f"[Refka] do_refka OK (start): {session_path} -> @{bot_username} ref={ref_param}")
 
         elif link_type == "startapp":
             await asyncio.wait_for(
@@ -287,7 +271,7 @@ async def do_refka(session_path, bot_username: str, link_type: str, ref_param: s
                 )),
                 timeout=TELETHON_TIMEOUT
             )
-            logger.info(f"[Refka] do_refka OK (startapp): {session_path} → @{bot_username} ref={ref_param}")
+            logger.info(f"[Refka] do_refka OK (startapp): {session_path} -> @{bot_username} ref={ref_param}")
 
         return {'success': True}
 
@@ -295,7 +279,105 @@ async def do_refka(session_path, bot_username: str, link_type: str, ref_param: s
         logger.warning(f"[Refka] do_refka TIMEOUT: {session_path}")
         return {'success': False, 'error': 'Таймаут'}
     except Exception as e:
-        logger.warning(f"[Refka] do_refka ERROR: {session_path} → {e}")
+        logger.warning(f"[Refka] do_refka ERROR: {session_path} -> {e}")
+        return {'success': False, 'error': str(e)}
+    finally:
+        await safe_disconnect(client)
+
+async def get_bot_buttons(session_path, bot_username: str):
+    """
+    Возвращает список кнопок из последних сообщений бота.
+    Каждый элемент: {'text': str, 'has_callback': bool}
+    """
+    client = TelegramClient(session_path, API_ID, API_HASH)
+    try:
+        await asyncio.wait_for(client.connect(), timeout=TELETHON_TIMEOUT)
+        if not await client.is_user_authorized():
+            return []
+        entity = await asyncio.wait_for(
+            client.get_entity(f"@{bot_username}"), timeout=TELETHON_TIMEOUT
+        )
+        messages = await asyncio.wait_for(
+            client.get_messages(entity, limit=5), timeout=TELETHON_TIMEOUT
+        )
+        buttons = []
+        seen = set()
+        for msg in messages:
+            if not msg.reply_markup:
+                continue
+            for row in msg.reply_markup.rows:
+                for btn in row.buttons:
+                    text = getattr(btn, 'text', '') or ''
+                    data = getattr(btn, 'data', None)
+                    if text and text not in seen:
+                        seen.add(text)
+                        buttons.append({'text': text, 'has_callback': data is not None})
+            if buttons:
+                break
+        logger.info(f"[Refka] get_bot_buttons: {session_path} -> {len(buttons)} кнопок")
+        return buttons
+    except Exception as e:
+        logger.warning(f"[Refka] get_bot_buttons ERROR: {session_path} -> {e}")
+        return []
+    finally:
+        await safe_disconnect(client)
+
+async def click_button_by_text(session_path, bot_username: str, button_text_fragment: str):
+    client = TelegramClient(session_path, API_ID, API_HASH)
+    try:
+        await asyncio.wait_for(client.connect(), timeout=TELETHON_TIMEOUT)
+        if not await client.is_user_authorized():
+            return {'success': False, 'error': 'Сессия не активна'}
+
+        entity = await asyncio.wait_for(
+            client.get_entity(f"@{bot_username}"), timeout=TELETHON_TIMEOUT
+        )
+
+        messages = await asyncio.wait_for(
+            client.get_messages(entity, limit=10), timeout=TELETHON_TIMEOUT
+        )
+
+        target_msg = None
+        target_btn = None
+
+        for msg in messages:
+            if not msg.reply_markup:
+                continue
+            for row in msg.reply_markup.rows:
+                for btn in row.buttons:
+                    btn_text = getattr(btn, 'text', '') or ''
+                    if button_text_fragment.lower() in btn_text.lower():
+                        target_msg = msg
+                        target_btn = btn
+                        break
+                if target_btn:
+                    break
+            if target_btn:
+                break
+
+        if not target_btn:
+            return {'success': False, 'error': f'Кнопка с текстом "{button_text_fragment}" не найдена'}
+
+        btn_data = getattr(target_btn, 'data', None)
+        if not btn_data:
+            return {'success': False, 'error': 'Кнопка не callback (скорее всего WebApp — нажать нельзя)'}
+
+        await asyncio.wait_for(
+            client(GetBotCallbackAnswerRequest(
+                peer=entity,
+                msg_id=target_msg.id,
+                data=btn_data,
+            )),
+            timeout=TELETHON_TIMEOUT
+        )
+        logger.info(f"[Refka] click_button OK: {session_path} -> '{target_btn.text}' @{bot_username}")
+        return {'success': True, 'button': target_btn.text}
+
+    except asyncio.TimeoutError:
+        logger.warning(f"[Refka] click_button TIMEOUT: {session_path}")
+        return {'success': False, 'error': 'Таймаут'}
+    except Exception as e:
+        logger.warning(f"[Refka] click_button ERROR: {session_path} -> {e}")
         return {'success': False, 'error': str(e)}
     finally:
         await safe_disconnect(client)
@@ -324,7 +406,6 @@ async def run_advanced_reactions(update, user_id, link, reaction_plan, view_sess
         parse_mode="Markdown"
     )
 
-    # ── Шаг 1: просмотры ──
     view_success = 0
     view_errors  = 0
     shuffled_viewers = list(view_sessions)
@@ -346,11 +427,9 @@ async def run_advanced_reactions(update, user_id, link, reaction_plan, view_sess
     )
     await asyncio.sleep(random.uniform(5, 15))
 
-    # ── Шаг 2: реакции ──
     reaction_success = 0
     reaction_errors  = 0
     reaction_report  = []
-
     shuffled_plan = list(reaction_plan)
     random.shuffle(shuffled_plan)
 
@@ -366,7 +445,6 @@ async def run_advanced_reactions(update, user_id, link, reaction_plan, view_sess
                 reaction_report.append(f"❌ {emoji} — {result['error'][:40]}")
             await asyncio.sleep(random.uniform(3, 10))
 
-    # ── Итог ──
     report_lines = "\n".join(reaction_report[:15])
     if len(reaction_report) > 15:
         report_lines += f"\n...и ещё {len(reaction_report) - 15}"
@@ -388,70 +466,161 @@ async def run_advanced_reactions(update, user_id, link, reaction_plan, view_sess
 #  ЛОГИКА РЕФКИ
 # ───────────────────────────────────────────
 
-async def run_refka(update, user_id, bot_username, link_type, ref_param, selected_accounts):
-    """Запускает переходы по реферальной ссылке для выбранных аккаунтов."""
+async def _process_refka_accounts(update, user_id, bot_username, link_type, ref_param,
+                                   accounts, button_text, skip_first=False):
+    """
+    Обрабатывает список аккаунтов для рефки.
+    skip_first=True — первый аккаунт уже прошёл do_refka, пропускаем его переход,
+    но нажимаем кнопку если нужно.
+    """
     active_tasks.add(user_id)
-    total = len(selected_accounts)
-    logger.info(
-        f"[Refka] START: user={user_id}, bot=@{bot_username}, "
-        f"type={link_type}, ref={ref_param}, accounts={total}"
-    )
-
-    await update.message.reply_text(
-        f"🚀 *Рефка запущена*\n\n"
-        f"🤖 Бот: `@{bot_username}`\n"
-        f"🔗 Тип: `{link_type}={ref_param}`\n"
-        f"👥 Аккаунтов: *{total}*\n"
-        f"⏱ Задержка: 3–8 сек между аккаунтами",
-        parse_mode="Markdown"
-    )
-
     results = []
-    for i, acc in enumerate(selected_accounts):
+
+    for i, acc in enumerate(accounts):
         phone        = acc[1]
         session_path = acc[2]
 
-        result = await do_refka(session_path, bot_username, link_type, ref_param)
-        result['phone'] = phone
+        if i == 0 and skip_first:
+            # Переход уже сделан — только кнопка
+            result = {'success': True, 'phone': phone, 'btn_clicked': False, 'btn_error': None}
+        else:
+            result = await do_refka(session_path, bot_username, link_type, ref_param)
+            result['phone']     = phone
+            result['btn_clicked'] = False
+            result['btn_error']   = None
+
+        if result['success'] and button_text:
+            wait = random.uniform(2, 5)
+            await asyncio.sleep(wait)
+            click = await click_button_by_text(session_path, bot_username, button_text)
+            if click['success']:
+                result['btn_clicked'] = True
+                logger.info(f"[Refka] [{i+1}/{len(accounts)}] {phone} -> кнопка '{click['button']}' OK")
+            else:
+                result['btn_error'] = click['error']
+                logger.warning(f"[Refka] [{i+1}/{len(accounts)}] {phone} -> кнопка не нажата: {click['error']}")
+
         results.append(result)
+        logger.info(f"[Refka] [{i+1}/{len(accounts)}] {phone} -> "
+                    f"{'OK' if result['success'] else result.get('error', '?')}")
 
-        logger.info(
-            f"[Refka] [{i+1}/{total}] {phone} → {'OK' if result['success'] else result['error']}"
-        )
-
-        # Задержка между аккаунтами (кроме последнего)
-        if i < total - 1:
+        if i < len(accounts) - 1:
             delay = random.uniform(3, 8)
-            logger.info(f"[Refka] Пауза {delay:.1f} сек.")
             await asyncio.sleep(delay)
 
     # ── Отчёт ──
     success_count = sum(1 for r in results if r['success'])
     error_count   = len(results) - success_count
+    btn_click_ok  = sum(1 for r in results if r.get('btn_clicked'))
+    btn_click_fail = sum(1 for r in results if button_text and not r.get('btn_clicked') and r['success'])
 
-    lines = [
-        f"📊 *Отчёт по рефке* `@{bot_username}`\n",
-        f"✅ Успешно: *{success_count}*",
-        f"❌ Ошибок:  *{error_count}*",
-        f"━━━━━━━━━━━━━━━━━━━━\n",
-    ]
+    lines = [f"📊 *Отчёт по рефке* `@{bot_username}`\n",
+             f"✅ Переходов успешно: *{success_count}*",
+             f"❌ Ошибок перехода: *{error_count}*"]
+    if button_text:
+        lines.append(f"🖱 Кнопка нажата: *{btn_click_ok}* | не нажата: *{btn_click_fail}*")
+    lines.append("━━━━━━━━━━━━━━━━━━━━\n")
+
     for r in results:
+        phone = r['phone']
         if r['success']:
-            lines.append(f"✅ `{r['phone']}` — успех")
+            if button_text:
+                if r['btn_clicked']:
+                    lines.append(f"✅ `{phone}` — переход + кнопка OK")
+                else:
+                    err = (r.get('btn_error') or '?')[:35]
+                    lines.append(f"⚠️ `{phone}` — переход OK | кнопка: {err}")
+            else:
+                lines.append(f"✅ `{phone}` — успех")
         else:
             err = (r.get('error') or 'неизвестная ошибка')[:50]
-            lines.append(f"❌ `{r['phone']}` — {err}")
+            lines.append(f"❌ `{phone}` — {err}")
 
-    report = "\n".join(lines)
     await update.message.reply_text(
-        report,
+        "\n".join(lines),
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(BACK_BUTTON)
     )
-    logger.info(
-        f"[Refka] DONE: user={user_id}, success={success_count}, errors={error_count}"
-    )
+    logger.info(f"[Refka] DONE: user={user_id}, success={success_count}, errors={error_count}, btn_ok={btn_click_ok}")
     active_tasks.discard(user_id)
+
+
+async def run_refka_with_button_detect(update, user_id, bot_username, link_type, ref_param, selected_accounts):
+    """
+    Шаг 1: делает переход первым аккаунтом,
+    получает список кнопок и спрашивает пользователя что нажать.
+    """
+    active_tasks.add(user_id)
+    first_acc = selected_accounts[0]
+
+    await update.message.reply_text(
+        f"🚀 *Рефка запущена*\n\n"
+        f"🤖 Бот: `@{bot_username}`\n"
+        f"🔗 Тип: `{link_type}={ref_param}`\n"
+        f"👥 Аккаунтов: *{len(selected_accounts)}*\n\n"
+        f"⏳ Делаю переход первым аккаунтом и смотрю кнопки...",
+        parse_mode="Markdown"
+    )
+
+    # Переход первым аккаунтом
+    result = await do_refka(first_acc[2], bot_username, link_type, ref_param)
+    if not result['success']:
+        await update.message.reply_text(
+            f"❌ Первый аккаунт не прошёл: {result.get('error', '?')}\n"
+            f"Попробуй ещё раз.",
+            reply_markup=InlineKeyboardMarkup(BACK_BUTTON)
+        )
+        active_tasks.discard(user_id)
+        return
+
+    # Ждём ответа от бота
+    await asyncio.sleep(3)
+
+    # Получаем кнопки
+    buttons = await get_bot_buttons(first_acc[2], bot_username)
+    active_tasks.discard(user_id)
+
+    if not buttons:
+        # Кнопок нет — спрашиваем вручную
+        user_states[user_id] = {
+            'step': 'waiting_refka_button',
+            'bot_username': bot_username,
+            'link_type': link_type,
+            'ref_param': ref_param,
+            'selected': selected_accounts,
+            'first_done': True,
+        }
+        await update.message.reply_text(
+            "🖱 Кнопок не обнаружено в ответе бота.\n\n"
+            "Введи фрагмент текста кнопки вручную\n"
+            "или `-` если нажимать не нужно:",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Показываем кнопки пользователю
+    btn_lines = []
+    for b in buttons:
+        icon = "✅" if b['has_callback'] else "🌐 WebApp"
+        btn_lines.append(f"{icon} `{b['text']}`")
+
+    user_states[user_id] = {
+        'step': 'waiting_refka_button',
+        'bot_username': bot_username,
+        'link_type': link_type,
+        'ref_param': ref_param,
+        'selected': selected_accounts,
+        'first_done': True,
+    }
+
+    await update.message.reply_text(
+        f"🖱 *Кнопки в боте @{bot_username}:*\n\n"
+        + "\n".join(btn_lines) +
+        "\n\n✅ — можно нажать  |  🌐 WebApp — нельзя\n\n"
+        "Введи фрагмент текста кнопки для нажатия\n"
+        "или `-` чтобы не нажимать:",
+        parse_mode="Markdown"
+    )
 
 # ───────────────────────────────────────────
 #  HANDLERS
@@ -610,7 +779,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         phones_list = "\n".join(
-            f"  {i+1}\\. `{acc[1]}`" for i, acc in enumerate(accounts)
+            f"  {i+1}. `{acc[1]}`" for i, acc in enumerate(accounts)
         )
         user_states[user_id] = {
             'step': 'waiting_refka_count',
@@ -620,13 +789,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'accounts': accounts,
         }
         await update.message.reply_text(
-            f"✅ Ссылка принята\\!\n\n"
+            f"✅ Ссылка принята!\n\n"
             f"🤖 Бот: `@{bot_username}`\n"
             f"🔗 Тип: `{link_type}={ref_param}`\n\n"
-            f"📋 *Активные аккаунты \\({len(accounts)} шт\\.\\):*\n"
+            f"📋 *Активные аккаунты ({len(accounts)} шт.):*\n"
             f"{phones_list}\n\n"
-            f"Введи количество аккаунтов для перехода \\(1–{len(accounts)}\\):",
-            parse_mode="MarkdownV2"
+            f"Введи количество аккаунтов для перехода (1–{len(accounts)}):",
+            parse_mode="Markdown"
         )
         return
 
@@ -643,21 +812,45 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Число от 1 до {len(accounts)}!")
             return
 
+        selected = random.sample(accounts, count)
+        user_states.pop(user_id, None)
+
         if user_id in active_tasks:
             await update.message.reply_text("⚠️ Задача уже запущена, подожди завершения!")
             return
 
-        selected = random.sample(accounts, count)
+        # Запускаем автоопределение кнопок
+        asyncio.create_task(run_refka_with_button_detect(
+            update, user_id,
+            state['bot_username'],
+            state['link_type'],
+            state['ref_param'],
+            selected,
+        ))
+        return
+
+    # ══════════════════════════════════════════
+    #  РЕФКА: шаг 3 — текст кнопки → запуск
+    # ══════════════════════════════════════════
+    if state.get('step') == 'waiting_refka_button':
+        if user_id in active_tasks:
+            await update.message.reply_text("⚠️ Задача уже запущена, подожди завершения!")
+            return
+
+        button_text = None if text.strip() == '-' else text.strip()
+        selected    = state['selected']
+        first_done  = state.get('first_done', False)
         user_states.pop(user_id, None)
 
-        # Запускаем задачу
-        asyncio.create_task(run_refka(
+        asyncio.create_task(_process_refka_accounts(
             update,
             user_id,
             state['bot_username'],
             state['link_type'],
             state['ref_param'],
             selected,
+            button_text,
+            skip_first=first_done,
         ))
         return
 
@@ -853,7 +1046,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 new_status = "Активен"
                 icon = "✅"
             db_execute("UPDATE accounts SET status_info = ? WHERE id = ?", (new_status, acc_id))
-            logger.info(f"Account toggled: id={acc_id} → {new_status}")
+            logger.info(f"Account toggled: id={acc_id} -> {new_status}")
             keyboard = [[InlineKeyboardButton("📋 Назад к списку", callback_data="full_list")]] + BACK_BUTTON
             await query.edit_message_text(
                 f"{icon} Аккаунт `{phone}` — **{new_status}**",
@@ -992,12 +1185,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         await query.edit_message_text(
-            "🔗 *Рефка \\(старт\\)*\n\n"
-            "Отправь ссылку на Telegram\\-бота:\n\n"
+            "🔗 *Рефка (старт)*\n\n"
+            "Отправь ссылку на Telegram-бота:\n\n"
             "`https://t.me/username?start=ref`\n"
             "или\n"
             "`https://t.me/username/app?startapp=ref`",
-            parse_mode="MarkdownV2"
+            parse_mode="Markdown"
         )
         user_states[user_id] = {'step': 'waiting_refka_link'}
         return
