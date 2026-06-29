@@ -9,7 +9,7 @@ import asyncio
 import zipfile
 import shutil
 import random
-from datetime import datetime
+from datetime import datetime, timedelta
 from telethon import TelegramClient
 from telethon.tl.functions.messages import (
     SendReactionRequest, GetMessagesViewsRequest,
@@ -54,6 +54,7 @@ logger.addHandler(file_handler)
 db_lock = asyncio.Lock()
 conn   = sqlite3.connect("data/accounts.db", check_same_thread=False)
 cursor = conn.cursor()
+
 cursor.execute('''
     CREATE TABLE IF NOT EXISTS accounts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -65,6 +66,34 @@ cursor.execute('''
         created_at TEXT
     )
 ''')
+
+# ── Таблица аналитики ──
+cursor.execute('''
+    CREATE TABLE IF NOT EXISTS analytics (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        account_id INTEGER,
+        phone TEXT,
+        action_type TEXT,
+        success INTEGER DEFAULT 1,
+        error_msg TEXT DEFAULT NULL,
+        target TEXT DEFAULT NULL,
+        created_at TEXT
+    )
+''')
+
+# ── Таблица задач ──
+cursor.execute('''
+    CREATE TABLE IF NOT EXISTS task_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_type TEXT,
+        total_accounts INTEGER,
+        success_count INTEGER,
+        error_count INTEGER,
+        details TEXT DEFAULT NULL,
+        created_at TEXT
+    )
+''')
+
 conn.commit()
 
 def db_execute(query, params=()):
@@ -87,6 +116,116 @@ def get_accounts():
     return cursor.fetchall()
 
 # ───────────────────────────────────────────
+#  АНАЛИТИКА — вспомогательные функции
+# ───────────────────────────────────────────
+
+def log_action(phone: str, action_type: str, success: bool, error_msg: str = None, target: str = None):
+    """Записывает действие аккаунта в таблицу аналитики."""
+    cursor.execute('SELECT id FROM accounts WHERE phone = ?', (phone,))
+    row = cursor.fetchone()
+    account_id = row[0] if row else None
+    db_execute(
+        'INSERT INTO analytics (account_id, phone, action_type, success, error_msg, target, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        (account_id, phone, action_type, 1 if success else 0, error_msg, target, datetime.now().isoformat())
+    )
+
+def log_task(task_type: str, total: int, success: int, errors: int, details: str = None):
+    """Записывает итоги задачи в историю задач."""
+    db_execute(
+        'INSERT INTO task_history (task_type, total_accounts, success_count, error_count, details, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+        (task_type, total, success, errors, details, datetime.now().isoformat())
+    )
+
+def get_analytics_summary(days: int = 7):
+    """Возвращает сводку аналитики за N дней."""
+    since = (datetime.now() - timedelta(days=days)).isoformat()
+    
+    # Общее количество действий
+    cursor.execute('SELECT COUNT(*) FROM analytics WHERE created_at >= ?', (since,))
+    total_actions = cursor.fetchone()[0]
+
+    # Успешные / ошибки
+    cursor.execute('SELECT COUNT(*) FROM analytics WHERE created_at >= ? AND success = 1', (since,))
+    total_success = cursor.fetchone()[0]
+    cursor.execute('SELECT COUNT(*) FROM analytics WHERE created_at >= ? AND success = 0', (since,))
+    total_errors = cursor.fetchone()[0]
+
+    # По типам действий
+    cursor.execute('''
+        SELECT action_type, COUNT(*) as cnt, SUM(success) as ok
+        FROM analytics WHERE created_at >= ?
+        GROUP BY action_type ORDER BY cnt DESC
+    ''', (since,))
+    by_type = cursor.fetchall()
+
+    # Топ аккаунтов по успеху
+    cursor.execute('''
+        SELECT phone, COUNT(*) as cnt, SUM(success) as ok
+        FROM analytics WHERE created_at >= ?
+        GROUP BY phone ORDER BY ok DESC LIMIT 5
+    ''', (since,))
+    top_accounts = cursor.fetchall()
+
+    # Топ проблемных аккаунтов
+    cursor.execute('''
+        SELECT phone, COUNT(*) as cnt, SUM(CASE WHEN success=0 THEN 1 ELSE 0 END) as errors
+        FROM analytics WHERE created_at >= ?
+        GROUP BY phone HAVING errors > 0 ORDER BY errors DESC LIMIT 5
+    ''', (since,))
+    problem_accounts = cursor.fetchall()
+
+    # Активность по дням
+    cursor.execute('''
+        SELECT DATE(created_at) as day, COUNT(*) as cnt, SUM(success) as ok
+        FROM analytics WHERE created_at >= ?
+        GROUP BY day ORDER BY day DESC LIMIT 7
+    ''', (since,))
+    daily = cursor.fetchall()
+
+    return {
+        'total_actions': total_actions,
+        'total_success': total_success,
+        'total_errors': total_errors,
+        'by_type': by_type,
+        'top_accounts': top_accounts,
+        'problem_accounts': problem_accounts,
+        'daily': daily,
+    }
+
+def get_task_history(limit: int = 10):
+    cursor.execute('''
+        SELECT task_type, total_accounts, success_count, error_count, created_at
+        FROM task_history ORDER BY created_at DESC LIMIT ?
+    ''', (limit,))
+    return cursor.fetchall()
+
+def get_account_analytics(phone: str, days: int = 30):
+    since = (datetime.now() - timedelta(days=days)).isoformat()
+    cursor.execute('''
+        SELECT action_type, COUNT(*) as cnt, SUM(success) as ok
+        FROM analytics WHERE phone = ? AND created_at >= ?
+        GROUP BY action_type ORDER BY cnt DESC
+    ''', (phone, since))
+    by_type = cursor.fetchall()
+
+    cursor.execute('''
+        SELECT COUNT(*), SUM(success)
+        FROM analytics WHERE phone = ? AND created_at >= ?
+    ''', (phone, since))
+    row = cursor.fetchone()
+    total = row[0] or 0
+    ok    = row[1] or 0
+
+    cursor.execute('''
+        SELECT error_msg, COUNT(*) as cnt
+        FROM analytics WHERE phone = ? AND success = 0 AND created_at >= ?
+        GROUP BY error_msg ORDER BY cnt DESC LIMIT 3
+    ''', (phone, since))
+    top_errors = cursor.fetchall()
+
+    return {'total': total, 'ok': ok, 'by_type': by_type, 'top_errors': top_errors}
+
+# ───────────────────────────────────────────
 #  СОСТОЯНИЯ И ЗАЩИТА ОТ ДВОЙНОГО ЗАПУСКА
 # ───────────────────────────────────────────
 user_states  = {}
@@ -103,6 +242,7 @@ MAIN_KEYBOARD = [
     [InlineKeyboardButton("🚀 Абуз TApp",         callback_data="abuse")],
     [InlineKeyboardButton("🔗 Рефка (старт)",     callback_data="refka")],
     [InlineKeyboardButton("📤 Экспорт аккаунтов", callback_data="export")],
+    [InlineKeyboardButton("📈 Аналитика",         callback_data="analytics")],
 ]
 BACK_BUTTON = [[InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]]
 
@@ -140,6 +280,14 @@ def parse_refka_link(url: str):
         return username, "start", qs["start"][0]
     else:
         raise ValueError("Не найден параметр ?start= или ?startapp= в ссылке.")
+
+def make_bar(value: int, total: int, length: int = 10) -> str:
+    """Текстовый прогресс-бар."""
+    if total == 0:
+        filled = 0
+    else:
+        filled = round((value / total) * length)
+    return "█" * filled + "░" * (length - filled)
 
 # ───────────────────────────────────────────
 #  TELETHON-ФУНКЦИИ
@@ -258,8 +406,6 @@ async def do_refka(session_path, bot_username: str, link_type: str, ref_param: s
                 client.send_message(entity, f"/start {ref_param}"),
                 timeout=TELETHON_TIMEOUT
             )
-            logger.info(f"[Refka] do_refka OK (start): {session_path} -> @{bot_username} ref={ref_param}")
-
         elif link_type == "startapp":
             await asyncio.wait_for(
                 client.invoke(RequestWebViewRequest(
@@ -271,8 +417,8 @@ async def do_refka(session_path, bot_username: str, link_type: str, ref_param: s
                 )),
                 timeout=TELETHON_TIMEOUT
             )
-            logger.info(f"[Refka] do_refka OK (startapp): {session_path} -> @{bot_username} ref={ref_param}")
 
+        logger.info(f"[Refka] do_refka OK ({link_type}): {session_path} -> @{bot_username} ref={ref_param}")
         return {'success': True}
 
     except asyncio.TimeoutError:
@@ -285,10 +431,6 @@ async def do_refka(session_path, bot_username: str, link_type: str, ref_param: s
         await safe_disconnect(client)
 
 async def get_bot_buttons(session_path, bot_username: str):
-    """
-    Возвращает список кнопок из последних сообщений бота.
-    Каждый элемент: {'text': str, 'has_callback': bool}
-    """
     client = TelegramClient(session_path, API_ID, API_HASH)
     try:
         await asyncio.wait_for(client.connect(), timeout=TELETHON_TIMEOUT)
@@ -314,7 +456,6 @@ async def get_bot_buttons(session_path, bot_username: str):
                         buttons.append({'text': text, 'has_callback': data is not None})
             if buttons:
                 break
-        logger.info(f"[Refka] get_bot_buttons: {session_path} -> {len(buttons)} кнопок")
         return buttons
     except Exception as e:
         logger.warning(f"[Refka] get_bot_buttons ERROR: {session_path} -> {e}")
@@ -332,7 +473,6 @@ async def click_button_by_text(session_path, bot_username: str, button_text_frag
         entity = await asyncio.wait_for(
             client.get_entity(f"@{bot_username}"), timeout=TELETHON_TIMEOUT
         )
-
         messages = await asyncio.wait_for(
             client.get_messages(entity, limit=10), timeout=TELETHON_TIMEOUT
         )
@@ -360,7 +500,7 @@ async def click_button_by_text(session_path, bot_username: str, button_text_frag
 
         btn_data = getattr(target_btn, 'data', None)
         if not btn_data:
-            return {'success': False, 'error': 'Кнопка не callback (скорее всего WebApp — нажать нельзя)'}
+            return {'success': False, 'error': 'Кнопка не callback (WebApp — нажать нельзя)'}
 
         await asyncio.wait_for(
             client(GetBotCallbackAnswerRequest(
@@ -374,7 +514,6 @@ async def click_button_by_text(session_path, bot_username: str, button_text_frag
         return {'success': True, 'button': target_btn.text}
 
     except asyncio.TimeoutError:
-        logger.warning(f"[Refka] click_button TIMEOUT: {session_path}")
         return {'success': False, 'error': 'Таймаут'}
     except Exception as e:
         logger.warning(f"[Refka] click_button ERROR: {session_path} -> {e}")
@@ -393,13 +532,13 @@ async def run_advanced_reactions(update, user_id, link, reaction_plan, view_sess
     post_id = int(match.group(2))
 
     total_reaction_accs = sum(len(accs) for _, accs in reaction_plan)
-    total_view_accs = len(view_sessions)
+    total_view_accs     = len(view_sessions)
 
     logger.info(f"run_advanced_reactions START: user={user_id}, link={link}, "
                 f"reactions={total_reaction_accs}, views={total_view_accs}")
 
     await update.message.reply_text(
-        f"🚀 **Запуск задачи:**\n"
+        f"🚀 *Запуск задачи:*\n"
         f"👁 Просмотры: {total_view_accs} аккаунтов\n"
         f"🔥 Реакции: {total_reaction_accs} аккаунтов\n"
         f"⏱ Сначала просмотры, потом реакции...",
@@ -412,15 +551,22 @@ async def run_advanced_reactions(update, user_id, link, reaction_plan, view_sess
     random.shuffle(shuffled_viewers)
 
     for session_path in shuffled_viewers:
+        # Получаем телефон из БД по session_path
+        cursor.execute('SELECT phone FROM accounts WHERE session_path = ?', (session_path,))
+        row = cursor.fetchone()
+        phone = row[0] if row else session_path
+
         result = await view_post(session_path, channel_username, post_id)
         if result['success']:
             view_success += 1
+            log_action(phone, 'view', True, target=link)
         else:
             view_errors += 1
+            log_action(phone, 'view', False, error_msg=result.get('error'), target=link)
         await asyncio.sleep(random.uniform(2, 6))
 
     await update.message.reply_text(
-        f"👁 **Просмотры готовы:**\n"
+        f"👁 *Просмотры готовы:*\n"
         f"✅ Успешно: {view_success}  ❌ Ошибок: {view_errors}\n\n"
         f"⏳ Пауза перед реакциями...",
         parse_mode="Markdown"
@@ -436,25 +582,36 @@ async def run_advanced_reactions(update, user_id, link, reaction_plan, view_sess
     for emoji, sessions in shuffled_plan:
         random.shuffle(sessions)
         for session_path in sessions:
+            cursor.execute('SELECT phone FROM accounts WHERE session_path = ?', (session_path,))
+            row = cursor.fetchone()
+            phone = row[0] if row else session_path
+
             result = await set_reaction(session_path, link, emoji)
             if result['success']:
                 reaction_success += 1
                 reaction_report.append(f"✅ {emoji}")
+                log_action(phone, 'reaction', True, target=link)
             else:
                 reaction_errors += 1
                 reaction_report.append(f"❌ {emoji} — {result['error'][:40]}")
+                log_action(phone, 'reaction', False, error_msg=result.get('error'), target=link)
             await asyncio.sleep(random.uniform(3, 10))
+
+    # Записываем задачу в историю
+    log_task('reactions', total_view_accs + total_reaction_accs,
+             view_success + reaction_success, view_errors + reaction_errors,
+             details=link)
 
     report_lines = "\n".join(reaction_report[:15])
     if len(reaction_report) > 15:
         report_lines += f"\n...и ещё {len(reaction_report) - 15}"
 
     await update.message.reply_text(
-        f"📊 **Итоговый отчёт:**\n\n"
+        f"📊 *Итоговый отчёт:*\n\n"
         f"👁 Просмотры: ✅{view_success} / ❌{view_errors}\n"
         f"💬 Реакции:   ✅{reaction_success} / ❌{reaction_errors}\n"
         f"📌 Всего аккаунтов: {total_view_accs + total_reaction_accs}\n\n"
-        f"**Детали:**\n{report_lines}",
+        f"*Детали:*\n{report_lines}",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(BACK_BUTTON)
     )
@@ -468,11 +625,6 @@ async def run_advanced_reactions(update, user_id, link, reaction_plan, view_sess
 
 async def _process_refka_accounts(update, user_id, bot_username, link_type, ref_param,
                                    accounts, button_text, skip_first=False):
-    """
-    Обрабатывает список аккаунтов для рефки.
-    skip_first=True — первый аккаунт уже прошёл do_refka, пропускаем его переход,
-    но нажимаем кнопку если нужно.
-    """
     active_tasks.add(user_id)
     results = []
 
@@ -481,13 +633,16 @@ async def _process_refka_accounts(update, user_id, bot_username, link_type, ref_
         session_path = acc[2]
 
         if i == 0 and skip_first:
-            # Переход уже сделан — только кнопка
             result = {'success': True, 'phone': phone, 'btn_clicked': False, 'btn_error': None}
         else:
             result = await do_refka(session_path, bot_username, link_type, ref_param)
-            result['phone']     = phone
+            result['phone']       = phone
             result['btn_clicked'] = False
             result['btn_error']   = None
+
+        # Логируем рефку
+        log_action(phone, 'refka', result['success'],
+                   error_msg=result.get('error'), target=f"@{bot_username}")
 
         if result['success'] and button_text:
             wait = random.uniform(2, 5)
@@ -495,24 +650,25 @@ async def _process_refka_accounts(update, user_id, bot_username, link_type, ref_
             click = await click_button_by_text(session_path, bot_username, button_text)
             if click['success']:
                 result['btn_clicked'] = True
+                log_action(phone, 'button_click', True, target=f"@{bot_username}:{button_text}")
                 logger.info(f"[Refka] [{i+1}/{len(accounts)}] {phone} -> кнопка '{click['button']}' OK")
             else:
                 result['btn_error'] = click['error']
+                log_action(phone, 'button_click', False,
+                           error_msg=click['error'], target=f"@{bot_username}:{button_text}")
                 logger.warning(f"[Refka] [{i+1}/{len(accounts)}] {phone} -> кнопка не нажата: {click['error']}")
 
         results.append(result)
-        logger.info(f"[Refka] [{i+1}/{len(accounts)}] {phone} -> "
-                    f"{'OK' if result['success'] else result.get('error', '?')}")
 
         if i < len(accounts) - 1:
-            delay = random.uniform(3, 8)
-            await asyncio.sleep(delay)
+            await asyncio.sleep(random.uniform(3, 8))
 
-    # ── Отчёт ──
-    success_count = sum(1 for r in results if r['success'])
-    error_count   = len(results) - success_count
-    btn_click_ok  = sum(1 for r in results if r.get('btn_clicked'))
+    success_count  = sum(1 for r in results if r['success'])
+    error_count    = len(results) - success_count
+    btn_click_ok   = sum(1 for r in results if r.get('btn_clicked'))
     btn_click_fail = sum(1 for r in results if button_text and not r.get('btn_clicked') and r['success'])
+
+    log_task('refka', len(accounts), success_count, error_count, details=f"@{bot_username}")
 
     lines = [f"📊 *Отчёт по рефке* `@{bot_username}`\n",
              f"✅ Переходов успешно: *{success_count}*",
@@ -546,10 +702,6 @@ async def _process_refka_accounts(update, user_id, bot_username, link_type, ref_
 
 
 async def run_refka_with_button_detect(update, user_id, bot_username, link_type, ref_param, selected_accounts):
-    """
-    Шаг 1: делает переход первым аккаунтом,
-    получает список кнопок и спрашивает пользователя что нажать.
-    """
     active_tasks.add(user_id)
     first_acc = selected_accounts[0]
 
@@ -562,9 +714,10 @@ async def run_refka_with_button_detect(update, user_id, bot_username, link_type,
         parse_mode="Markdown"
     )
 
-    # Переход первым аккаунтом
     result = await do_refka(first_acc[2], bot_username, link_type, ref_param)
     if not result['success']:
+        log_action(first_acc[1], 'refka', False,
+                   error_msg=result.get('error'), target=f"@{bot_username}")
         await update.message.reply_text(
             f"❌ Первый аккаунт не прошёл: {result.get('error', '?')}\n"
             f"Попробуй ещё раз.",
@@ -573,15 +726,13 @@ async def run_refka_with_button_detect(update, user_id, bot_username, link_type,
         active_tasks.discard(user_id)
         return
 
-    # Ждём ответа от бота
+    log_action(first_acc[1], 'refka', True, target=f"@{bot_username}")
     await asyncio.sleep(3)
 
-    # Получаем кнопки
     buttons = await get_bot_buttons(first_acc[2], bot_username)
     active_tasks.discard(user_id)
 
     if not buttons:
-        # Кнопок нет — спрашиваем вручную
         user_states[user_id] = {
             'step': 'waiting_refka_button',
             'bot_username': bot_username,
@@ -598,7 +749,6 @@ async def run_refka_with_button_detect(update, user_id, bot_username, link_type,
         )
         return
 
-    # Показываем кнопки пользователю
     btn_lines = []
     for b in buttons:
         icon = "✅" if b['has_callback'] else "🌐 WebApp"
@@ -621,6 +771,127 @@ async def run_refka_with_button_detect(update, user_id, bot_username, link_type,
         "или `-` чтобы не нажимать:",
         parse_mode="Markdown"
     )
+
+# ───────────────────────────────────────────
+#  АНАЛИТИКА — форматирование сообщений
+# ───────────────────────────────────────────
+
+def format_analytics(days: int = 7) -> str:
+    s = get_analytics_summary(days)
+
+    total   = s['total_actions']
+    success = s['total_success']
+    errors  = s['total_errors']
+    rate    = round((success / total * 100) if total > 0 else 0)
+
+    lines = [
+        f"📈 *Аналитика за {days} дней*\n",
+        f"━━━━━━━━━━━━━━━━━━━━",
+        f"📌 Всего действий: *{total}*",
+        f"✅ Успешных:  *{success}*  {make_bar(success, total)}",
+        f"❌ Ошибок:    *{errors}*  {make_bar(errors, total)}",
+        f"📊 Успех:     *{rate}%*\n",
+    ]
+
+    # По типам
+    if s['by_type']:
+        lines.append("🔧 *По типам действий:*")
+        type_icons = {
+            'reaction': '🔥',
+            'view': '👁',
+            'refka': '🔗',
+            'button_click': '🖱',
+            'tapp': '🚀',
+        }
+        for action_type, cnt, ok in s['by_type']:
+            icon = type_icons.get(action_type, '▪️')
+            ok   = ok or 0
+            err  = cnt - ok
+            pct  = round((ok / cnt * 100) if cnt > 0 else 0)
+            lines.append(f"  {icon} {action_type}: {cnt} (✅{ok} ❌{err} {pct}%)")
+        lines.append("")
+
+    # Активность по дням
+    if s['daily']:
+        lines.append("📅 *Активность по дням:*")
+        for day, cnt, ok in s['daily']:
+            ok  = ok or 0
+            bar = make_bar(ok, cnt, 8)
+            lines.append(f"  `{day}` {bar} {cnt} ({ok}✅)")
+        lines.append("")
+
+    # Топ аккаунтов
+    if s['top_accounts']:
+        lines.append("🏆 *Топ аккаунтов:*")
+        medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+        for i, (phone, cnt, ok) in enumerate(s['top_accounts']):
+            ok  = ok or 0
+            pct = round((ok / cnt * 100) if cnt > 0 else 0)
+            medal = medals[i] if i < len(medals) else "▪️"
+            lines.append(f"  {medal} `{phone}` — {cnt} действий ({pct}%)")
+        lines.append("")
+
+    # Проблемные аккаунты
+    if s['problem_accounts']:
+        lines.append("⚠️ *Проблемные аккаунты:*")
+        for phone, cnt, errors in s['problem_accounts']:
+            errors = errors or 0
+            pct    = round((errors / cnt * 100) if cnt > 0 else 0)
+            lines.append(f"  🔴 `{phone}` — {errors} ошибок из {cnt} ({pct}%)")
+
+    return "\n".join(lines)
+
+def format_task_history() -> str:
+    tasks = get_task_history(10)
+    if not tasks:
+        return "📋 История задач пуста."
+
+    task_icons = {
+        'reactions': '🔥',
+        'refka':     '🔗',
+        'tapp':      '🚀',
+    }
+
+    lines = ["📋 *История задач (последние 10):*\n", "━━━━━━━━━━━━━━━━━━━━"]
+    for task_type, total, success, errors, created_at in tasks:
+        icon = task_icons.get(task_type, '▪️')
+        date = created_at[:16].replace('T', ' ') if created_at else '—'
+        pct  = round((success / total * 100) if total > 0 else 0)
+        lines.append(
+            f"{icon} *{task_type}* | {date}\n"
+            f"   👥 {total} акк → ✅{success} ❌{errors} ({pct}%)\n"
+        )
+    return "\n".join(lines)
+
+def format_account_analytics(phone: str) -> str:
+    data = get_account_analytics(phone, days=30)
+    total = data['total']
+    ok    = data['ok']
+    errors = total - ok
+    rate  = round((ok / total * 100) if total > 0 else 0)
+
+    lines = [
+        f"👤 *Аналитика аккаунта* `{phone}`\n",
+        f"━━━━━━━━━━━━━━━━━━━━",
+        f"📌 Всего действий за 30 дней: *{total}*",
+        f"✅ Успешных: *{ok}* ({rate}%)",
+        f"❌ Ошибок:   *{errors}*\n",
+    ]
+
+    if data['by_type']:
+        lines.append("🔧 *По типам:*")
+        for action_type, cnt, ok_cnt in data['by_type']:
+            ok_cnt = ok_cnt or 0
+            lines.append(f"  ▪️ {action_type}: {cnt} (✅{ok_cnt})")
+        lines.append("")
+
+    if data['top_errors']:
+        lines.append("🔴 *Частые ошибки:*")
+        for err_msg, cnt in data['top_errors']:
+            err_short = (err_msg or 'неизвестно')[:50]
+            lines.append(f"  ❌ {err_short} — {cnt}x")
+
+    return "\n".join(lines)
 
 # ───────────────────────────────────────────
 #  HANDLERS
@@ -757,6 +1028,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = user_states.get(user_id, {})
 
     # ══════════════════════════════════════════
+    #  АНАЛИТИКА — выбор аккаунта для детальной инфо
+    # ══════════════════════════════════════════
+    if state.get('step') == 'waiting_analytics_phone':
+        user_states.pop(user_id, None)
+        msg = format_account_analytics(text)
+        await update.message.reply_text(
+            msg,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(BACK_BUTTON)
+        )
+        return
+
+    # ══════════════════════════════════════════
     #  РЕФКА: шаг 1 — получаем ссылку
     # ══════════════════════════════════════════
     if state.get('step') == 'waiting_refka_link':
@@ -819,7 +1103,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⚠️ Задача уже запущена, подожди завершения!")
             return
 
-        # Запускаем автоопределение кнопок
         asyncio.create_task(run_refka_with_button_detect(
             update, user_id,
             state['bot_username'],
@@ -830,7 +1113,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ══════════════════════════════════════════
-    #  РЕФКА: шаг 3 — текст кнопки → запуск
+    #  РЕФКА: шаг 3 — текст кнопки
     # ══════════════════════════════════════════
     if state.get('step') == 'waiting_refka_button':
         if user_id in active_tasks:
@@ -868,7 +1151,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_states[user_id] = {'step': 'waiting_reaction_count', 'link': text, 'total': total}
         await update.message.reply_text(
             f"✅ Ссылка принята!\n\n"
-            f"📱 Активных аккаунтов: **{total}**\n\n"
+            f"📱 Активных аккаунтов: *{total}*\n\n"
             f"Сколько аккаунтов поставят реакции? (1–{total})",
             parse_mode="Markdown"
         )
@@ -895,7 +1178,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"👍 Реакции: {count} аккаунтов\n"
             f"👁 Просмотры: {view_count} аккаунтов\n\n"
-            f"Задай распределение (сумма = **{count}**):\n"
+            f"Задай распределение (сумма = *{count}*):\n"
             f"Формат: `🔥3 ❤️2 ⚡2`\n\n"
             f"Доступные: 🔥 ❤️ ⚡ 👍 👎 🎉 🤩 😢 💯 🤮",
             parse_mode="Markdown"
@@ -934,12 +1217,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         view_sessions = [acc[2] for acc in view_accs]
 
-        plan_text  = "📋 **План действий:**\n\n"
+        plan_text  = "📋 *План действий:*\n\n"
         plan_text += f"👁 Просмотры: {len(view_sessions)} аккаунтов\n"
         for emoji, sessions in reaction_plan:
             plan_text += f"{emoji} Реакция: {len(sessions)} аккаунтов\n"
         plan_text += "\n⏱ Задержки: 2–6 сек (просмотры), 3–10 сек (реакции)\n"
-        plan_text += "Подтверди запуск — напиши **да** или **нет**"
+        plan_text += "Подтверди запуск — напиши *да* или *нет*"
 
         user_states[user_id] = {
             'step': 'waiting_reaction_confirm',
@@ -988,6 +1271,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         success_count = 0
         error_count   = 0
         report        = []
+
         for acc in accounts:
             phone        = acc[1]
             session_path = acc[2]
@@ -995,13 +1279,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if result['success']:
                 success_count += 1
                 report.append(f"✅ {phone} — @{result['bot']}")
+                log_action(phone, 'tapp', True, target=text)
             else:
                 error_count += 1
                 report.append(f"❌ {phone} — {result['error'][:40]}")
+                log_action(phone, 'tapp', False, error_msg=result.get('error'), target=text)
             await asyncio.sleep(random.uniform(3, 8))
 
+        log_task('tapp', len(accounts), success_count, error_count, details=text)
+
         await update.message.reply_text(
-            f"📊 **Отчёт по абузу:**\n\n"
+            f"📊 *Отчёт по абузу:*\n\n"
             f"✅ Успешно: {success_count}\n"
             f"❌ Ошибок: {error_count}\n"
             f"📌 Всего: {success_count + error_count}\n\n"
@@ -1049,7 +1337,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.info(f"Account toggled: id={acc_id} -> {new_status}")
             keyboard = [[InlineKeyboardButton("📋 Назад к списку", callback_data="full_list")]] + BACK_BUTTON
             await query.edit_message_text(
-                f"{icon} Аккаунт `{phone}` — **{new_status}**",
+                f"{icon} Аккаунт `{phone}` — *{new_status}*",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
@@ -1064,6 +1352,72 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _show_accounts_page(query, page)
         return
 
+    # ════════════════════════════════════════
+    #  АНАЛИТИКА
+    # ════════════════════════════════════════
+    if data == "analytics":
+        keyboard = [
+            [InlineKeyboardButton("📅 За 7 дней",  callback_data="analytics_7")],
+            [InlineKeyboardButton("📅 За 30 дней", callback_data="analytics_30")],
+            [InlineKeyboardButton("📋 История задач", callback_data="analytics_tasks")],
+            [InlineKeyboardButton("👤 По аккаунту", callback_data="analytics_account")],
+        ] + BACK_BUTTON
+        await query.edit_message_text(
+            "📈 *Аналитика*\n\nВыбери раздел:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+
+    if data == "analytics_7":
+        msg = format_analytics(7)
+        await query.edit_message_text(
+            msg, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔙 Назад", callback_data="analytics")]] + BACK_BUTTON
+            )
+        )
+        return
+
+    if data == "analytics_30":
+        msg = format_analytics(30)
+        await query.edit_message_text(
+            msg, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔙 Назад", callback_data="analytics")]] + BACK_BUTTON
+            )
+        )
+        return
+
+    if data == "analytics_tasks":
+        msg = format_task_history()
+        await query.edit_message_text(
+            msg, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔙 Назад", callback_data="analytics")]] + BACK_BUTTON
+            )
+        )
+        return
+
+    if data == "analytics_account":
+        accounts = get_accounts()
+        if not accounts:
+            await query.edit_message_text(
+                "❌ Нет аккаунтов!",
+                reply_markup=InlineKeyboardMarkup(BACK_BUTTON)
+            )
+            return
+        # Показываем список для выбора
+        phones_list = "\n".join(f"  `{acc[1]}`" for acc in accounts[:20])
+        user_states[user_id] = {'step': 'waiting_analytics_phone'}
+        await query.edit_message_text(
+            f"👤 *Аналитика по аккаунту*\n\n"
+            f"Аккаунты:\n{phones_list}\n\n"
+            f"Введи номер телефона (с +):",
+            parse_mode="Markdown"
+        )
+        return
+
     # ── Статистика ──
     if data == "stats":
         accounts = get_accounts()
@@ -1074,24 +1428,33 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         total  = len(accounts)
-        active = sum(1 for a in accounts if "Активен" in a[5])
-        banned = sum(1 for a in accounts if "Забанен" in a[5])
-        error  = sum(1 for a in accounts if "Ошибка"  in a[5])
+        active = sum(1 for a in accounts if "Активен"  in a[5])
+        banned = sum(1 for a in accounts if "Забанен"  in a[5])
+        error  = sum(1 for a in accounts if "Ошибка"   in a[5])
         off    = sum(1 for a in accounts if "Отключен" in a[5])
-        text   = (
-            f"📊 **Статистика фермы:**\n\n"
+
+        # Быстрая сводка из аналитики
+        cursor.execute('SELECT COUNT(*), SUM(success) FROM analytics')
+        row = cursor.fetchone()
+        all_actions = row[0] or 0
+        all_ok      = row[1] or 0
+
+        text = (
+            f"📊 *Статистика фермы:*\n\n"
             f"📱 Всего: {total}\n"
             f"🟢 Активны: {active}\n"
             f"⛔ Отключены: {off}\n"
             f"🔴 Забанены: {banned}\n"
             f"⚠️ Ошибок: {error}\n\n"
-            f"📋 **Последние 5:**\n"
+            f"📈 *Всего действий:* {all_actions} (✅{all_ok} ❌{all_actions - all_ok})\n\n"
+            f"📋 *Последние 5:*\n"
         )
         for acc in accounts[:5]:
             _, phone, _, _, name, status_info, _ = acc
             text += f"{acc_emoji(status_info)} `{phone}` — {status_info}\n"
         keyboard = [
             [InlineKeyboardButton("📋 Все аккаунты", callback_data="full_list")],
+            [InlineKeyboardButton("📈 Подробная аналитика", callback_data="analytics")],
         ] + BACK_BUTTON
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
         return
@@ -1129,7 +1492,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Загрузить сессию ──
     if data == "upload_session":
         await query.edit_message_text(
-            "📂 **Загрузка сессии**\n\n"
+            "📂 *Загрузка сессии*\n\n"
             "Отправь `.session` файл или ZIP-архив с папкой `sessions/`.",
             parse_mode="Markdown"
         )
@@ -1147,8 +1510,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("⚠️ Сейчас уже идёт задача, подожди!", reply_markup=InlineKeyboardMarkup(BACK_BUTTON))
             return
         await query.edit_message_text(
-            f"🔥 **Расширенные реакции**\n\n"
-            f"📱 Доступно аккаунтов: **{total}**\n\n"
+            f"🔥 *Расширенные реакции*\n\n"
+            f"📱 Доступно аккаунтов: *{total}*\n\n"
             f"Отправь ссылку на пост:\n`https://t.me/durov/123`",
             parse_mode="Markdown"
         )
@@ -1167,9 +1530,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_states[user_id] = {'step': 'waiting_link'}
         return
 
-    # ══════════════════════════════════════════
-    #  РЕФКА (старт) — кнопка в главном меню
-    # ══════════════════════════════════════════
+    # ── Рефка ──
     if data == "refka":
         if user_id in active_tasks:
             await query.edit_message_text(
@@ -1236,7 +1597,7 @@ async def _show_accounts_page(query, page: int):
     start_idx   = page * per_page
     page_accs   = accounts[start_idx:start_idx + per_page]
 
-    text = f"📋 **Аккаунты (стр. {page + 1}/{total_pages}):**\n\n"
+    text = f"📋 *Аккаунты (стр. {page + 1}/{total_pages}):*\n\n"
     for acc in page_accs:
         acc_id, phone, _, _, name, status_info, created_at = acc
         e    = acc_emoji(status_info)
