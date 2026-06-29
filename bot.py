@@ -11,7 +11,7 @@ import shutil
 import random
 from datetime import datetime
 from telethon import TelegramClient
-from telethon.tl.functions.messages import SendReactionRequest, GetMessagesViewsRequest, RequestWebViewRequest
+from telethon.tl.functions.messages import SendReactionRequest, GetMessagesViewsRequest
 from telethon.tl.types import ReactionEmoji
 
 # ───────────────────────────────────────────
@@ -92,14 +92,13 @@ user_states    = {}
 active_tasks   = set()   # user_id тех, у кого сейчас идёт задача
 
 # ───────────────────────────────────────────
-#  ГЛАВНОЕ МЕНЮ (ДОБАВЛЕНА КНОПКА РЕФКИ)
+#  ГЛАВНОЕ МЕНЮ
 # ───────────────────────────────────────────
 MAIN_KEYBOARD = [
     [InlineKeyboardButton("📊 Статистика",       callback_data="stats")],
     [InlineKeyboardButton("🔄 Обновить статусы", callback_data="refresh")],
     [InlineKeyboardButton("📂 Загрузить сессию", callback_data="upload_session")],
     [InlineKeyboardButton("🔥 Реакции",          callback_data="reaction")],
-    [InlineKeyboardButton("🔗 Рефка (старт)",    callback_data="referral")],
     [InlineKeyboardButton("🚀 Абуз TApp",        callback_data="abuse")],
     [InlineKeyboardButton("📤 Экспорт аккаунтов",callback_data="export")],
 ]
@@ -127,100 +126,6 @@ async def safe_disconnect(client):
         await client.disconnect()
     except Exception:
         pass
-
-# ───────────────────────────────────────────
-#  НОВАЯ ФУНКЦИЯ ДЛЯ РЕФЕРАЛКИ (СТАРТ)
-# ───────────────────────────────────────────
-async def process_referral_start(session_path, link):
-    """Переходит по ссылке и жмёт старт (отправляет /start)"""
-    client = TelegramClient(session_path, API_ID, API_HASH)
-    try:
-        await asyncio.wait_for(client.connect(), timeout=TELETHON_TIMEOUT)
-        if not await client.is_user_authorized():
-            return {'success': False, 'error': 'Сессия не активна'}
-        
-        # Парсим ссылку
-        match_tapp = re.search(r't\.me/([^/]+)/app\?startapp=([^&]+)', link)
-        match_start = re.search(r't\.me/([^?]+)\?start=([^&]+)', link)
-        match_bot = re.search(r't\.me/([^/?]+)', link)
-        
-        if match_tapp:
-            bot_username = match_tapp.group(1)
-            start_param = match_tapp.group(2)
-            bot = await asyncio.wait_for(client.get_entity(f"@{bot_username}"), timeout=TELETHON_TIMEOUT)
-            await client.send_message(bot, f"/start {start_param}")
-            await asyncio.sleep(2)
-            try:
-                webview = await asyncio.wait_for(
-                    client.invoke(RequestWebViewRequest(
-                        peer=bot, bot=bot, platform='android',
-                        url=f'https://t.me/{bot_username}', from_background=False
-                    )),
-                    timeout=TELETHON_TIMEOUT
-                )
-                logger.info(f"referral_start OK (tapp): {session_path} → @{bot_username}")
-                return {'success': True, 'type': 'tapp', 'bot': bot_username}
-            except Exception:
-                logger.info(f"referral_start OK (tapp no webview): {session_path} → @{bot_username}")
-                return {'success': True, 'type': 'tapp_no_webview', 'bot': bot_username}
-        
-        elif match_start:
-            bot_username = match_start.group(1)
-            start_param = match_start.group(2)
-            bot = await asyncio.wait_for(client.get_entity(f"@{bot_username}"), timeout=TELETHON_TIMEOUT)
-            await client.send_message(bot, f"/start {start_param}")
-            await asyncio.sleep(2)
-            logger.info(f"referral_start OK (start): {session_path} → @{bot_username}")
-            return {'success': True, 'type': 'start', 'bot': bot_username}
-        
-        elif match_bot:
-            bot_username = match_bot.group(1)
-            bot = await asyncio.wait_for(client.get_entity(f"@{bot_username}"), timeout=TELETHON_TIMEOUT)
-            await client.send_message(bot, "/start")
-            await asyncio.sleep(2)
-            logger.info(f"referral_start OK (start_no_param): {session_path} → @{bot_username}")
-            return {'success': True, 'type': 'start_no_param', 'bot': bot_username}
-        
-        else:
-            return {'success': False, 'error': 'Не удалось распознать ссылку'}
-            
-    except asyncio.TimeoutError:
-        return {'success': False, 'error': 'Таймаут'}
-    except Exception as e:
-        logger.warning(f"referral_start ERROR: {session_path} → {e}")
-        return {'success': False, 'error': str(e)}
-    finally:
-        await safe_disconnect(client)
-
-async def run_referral(update, user_id, selected_accounts, link):
-    """Запускает рефку на выбранных аккаунтах"""
-    active_tasks.add(user_id)
-    await update.message.reply_text(f"🚀 Запускаю рефку на {len(selected_accounts)} аккаунтах...")
-    success_count = 0
-    error_count = 0
-    report = []
-    for acc in selected_accounts:
-        phone = acc[1]
-        session_path = acc[2]
-        await update.message.reply_text(f"🔄 {phone}...")
-        result = await process_referral_start(session_path, link)
-        if result['success']:
-            success_count += 1
-            report.append(f"✅ {phone} — успешно! (@{result['bot']})")
-        else:
-            error_count += 1
-            report.append(f"❌ {phone} — ошибка: {result['error'][:40]}")
-        await asyncio.sleep(random.uniform(3, 8))
-    total = success_count + error_count
-    report_text = (
-        f"📊 **Отчёт по рефке:**\n\n"
-        f"✅ Успешно: {success_count}\n"
-        f"❌ Ошибок: {error_count}\n"
-        f"📌 Всего: {total}\n\n"
-        f"Детали:\n" + "\n".join(report[:10])
-    )
-    await update.message.reply_text(report_text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(BACK_BUTTON))
-    active_tasks.discard(user_id)
 
 # ───────────────────────────────────────────
 #  TELETHON-ФУНКЦИИ (с таймаутом и finally)
@@ -541,54 +446,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text  = update.message.text.strip()
     state = user_states.get(user_id, {})
-
-    # ── РЕФЕРАЛКА: ШАГ 1 — ссылка ──
-    if state.get('step') == 'waiting_referral_link':
-        if 't.me' not in text:
-            await update.message.reply_text("❌ Неверная ссылка! Должен быть t.me")
-            return
-        accounts = get_accounts()
-        if not accounts:
-            await update.message.reply_text("❌ Нет активных аккаунтов!")
-            user_states.pop(user_id, None)
-            return
-        # Сохраняем ссылку и просим ввести количество
-        user_states[user_id] = {
-            'step': 'waiting_referral_count',
-            'link': text,
-            'total': len(accounts)
-        }
-        await update.message.reply_text(
-            f"🔗 **Ссылка принята!**\n\n"
-            f"📱 Доступно аккаунтов: **{len(accounts)}**\n"
-            f"Введи количество аккаунтов для перехода (1–{len(accounts)})",
-            parse_mode="Markdown"
-        )
-        return
-
-    # ── РЕФЕРАЛКА: ШАГ 2 — количество ──
-    if state.get('step') == 'waiting_referral_count':
-        if not text.isdigit():
-            await update.message.reply_text("❌ Введи число!")
-            return
-        count = int(text)
-        total = state['total']
-        if count < 1 or count > total:
-            await update.message.reply_text(f"❌ Число от 1 до {total}!")
-            return
-        # Берём случайные аккаунты
-        accounts = get_accounts()
-        random.shuffle(accounts)
-        selected = accounts[:count]
-        link = state['link']
-        if user_id in active_tasks:
-            await update.message.reply_text("⚠️ Задача уже запущена, подожди!")
-            user_states.pop(user_id, None)
-            return
-        # Запускаем рефку
-        user_states.pop(user_id, None)
-        await run_referral(update, user_id, selected, link)
-        return
 
     # ── Реакции: шаг 1 — ссылка ──
     if state.get('step') == 'waiting_reaction_link':
