@@ -552,7 +552,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = f"📋 **Аккаунты (страница {page + 1} из {total_pages}):**\n\n"
         for acc in page_accounts:
             acc_id, phone, session_path, status, name, status_info, created_at = acc
-            emoji = "🟢" if status_info == "Активен" else "🔴"
+            emoji = "🟢" if ("Активен" in status_info) else "🔴"
             text += f"{emoji} `{phone}` — {status_info}\n   🆔 ID: {acc_id}\n\n"
         keyboard = []
         for acc in page_accounts:
@@ -577,7 +577,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("📊 Аккаунтов пока нет")
             return
         total = len(accounts)
-        active = sum(1 for acc in accounts if acc[5] == "Активен")
+        active = sum(1 for acc in accounts if "Активен" in acc[5])
         banned = sum(1 for acc in accounts if "Забанен" in acc[5])
         error = sum(1 for acc in accounts if "Ошибка" in acc[5])
         text = (
@@ -588,7 +588,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         for acc in accounts[:5]:
             acc_id, phone, session_path, status, name, status_info, created_at = acc
-            e = "🟢" if status_info == "Активен" else "🔴"
+            e = "🟢" if ("Активен" in status_info) else "🔴"
             text += f"{e} `{phone}` — {status_info}\n"
         keyboard = [[InlineKeyboardButton("📋 Все аккаунты", callback_data="full_list")]]
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -608,7 +608,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = f"📋 **Аккаунты (стр. {page + 1}/{total_pages}):**\n\n"
         for acc in page_accounts:
             acc_id, phone, session_path, status, name, status_info, created_at = acc
-            e = "🟢" if status_info == "Активен" else "🔴"
+            e = "🟢" if ("Активен" in status_info) else "🔴"
             text += f"{e} `{phone}` — {status_info}\n   🆔 ID: {acc_id}\n\n"
         keyboard = []
         for acc in page_accounts:
