@@ -11,8 +11,9 @@ import shutil
 import random
 from datetime import datetime
 from telethon import TelegramClient
-from telethon.tl.functions.messages import SendReactionRequest, GetMessagesViewsRequest
+from telethon.tl.functions.messages import SendReactionRequest, GetMessagesViewsRequest, RequestWebViewRequest
 from telethon.tl.types import ReactionEmoji
+from urllib.parse import urlparse, parse_qs
 
 # ───────────────────────────────────────────
 #  КОНФИГ
@@ -34,12 +35,10 @@ os.makedirs("data/logs", exist_ok=True)
 logger = logging.getLogger("farm_bot")
 logger.setLevel(logging.INFO)
 
-# В консоль
 console_handler = logging.StreamHandler()
 console_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
 logger.addHandler(console_handler)
 
-# В файл с ротацией (макс 5 МБ, 3 файла)
 file_handler = logging.handlers.RotatingFileHandler(
     "data/logs/bot.log", maxBytes=5*1024*1024, backupCount=3, encoding="utf-8"
 )
@@ -92,7 +91,7 @@ user_states    = {}
 active_tasks   = set()   # user_id тех, у кого сейчас идёт задача
 
 # ───────────────────────────────────────────
-#  ГЛАВНОЕ МЕНЮ
+#  ГЛАВНОЕ МЕНЮ  (добавлена кнопка «🔗 Рефка»)
 # ───────────────────────────────────────────
 MAIN_KEYBOARD = [
     [InlineKeyboardButton("📊 Статистика",       callback_data="stats")],
@@ -100,6 +99,7 @@ MAIN_KEYBOARD = [
     [InlineKeyboardButton("📂 Загрузить сессию", callback_data="upload_session")],
     [InlineKeyboardButton("🔥 Реакции",          callback_data="reaction")],
     [InlineKeyboardButton("🚀 Абуз TApp",        callback_data="abuse")],
+    [InlineKeyboardButton("🔗 Рефка (старт)",    callback_data="refka")],   # ← НОВАЯ КНОПКА
     [InlineKeyboardButton("📤 Экспорт аккаунтов",callback_data="export")],
 ]
 BACK_BUTTON = [[InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]]
@@ -126,6 +126,30 @@ async def safe_disconnect(client):
         await client.disconnect()
     except Exception:
         pass
+
+def parse_refka_link(url: str):
+    """
+    Разбирает реферальную ссылку.
+    Возвращает (bot_username, link_type, ref_param).
+    link_type: 'start' | 'startapp'
+    Поддерживает:
+      https://t.me/username?start=ref
+      https://t.me/username/app?startapp=ref
+    """
+    parsed = urlparse(url)
+    qs = parse_qs(parsed.query)
+    path_parts = parsed.path.strip("/").split("/")
+    username = path_parts[0] if path_parts else ""
+
+    if not username:
+        raise ValueError("Не удалось определить username бота.")
+
+    if "startapp" in qs:
+        return username, "startapp", qs["startapp"][0]
+    elif "start" in qs:
+        return username, "start", qs["start"][0]
+    else:
+        raise ValueError("Не найден параметр ?start= или ?startapp= в ссылке.")
 
 # ───────────────────────────────────────────
 #  TELETHON-ФУНКЦИИ (с таймаутом и finally)
@@ -199,7 +223,6 @@ async def set_reaction(session_path, link, emoji="🔥"):
         await safe_disconnect(client)
 
 async def open_tapp(session_path, link):
-    from telethon.tl.functions.messages import RequestWebViewRequest
     client = TelegramClient(session_path, API_ID, API_HASH)
     try:
         await asyncio.wait_for(client.connect(), timeout=TELETHON_TIMEOUT)
@@ -226,6 +249,53 @@ async def open_tapp(session_path, link):
         return {'success': False, 'error': 'Таймаут'}
     except Exception as e:
         logger.warning(f"open_tapp ERROR: {session_path} → {e}")
+        return {'success': False, 'error': str(e)}
+    finally:
+        await safe_disconnect(client)
+
+async def do_refka(session_path, bot_username: str, link_type: str, ref_param: str):
+    """
+    Выполняет реферальный переход для одного аккаунта.
+    link_type='start'    → отправляет /start {ref_param}
+    link_type='startapp' → открывает WebApp через RequestWebViewRequest
+    """
+    client = TelegramClient(session_path, API_ID, API_HASH)
+    try:
+        await asyncio.wait_for(client.connect(), timeout=TELETHON_TIMEOUT)
+        if not await client.is_user_authorized():
+            return {'success': False, 'error': 'Сессия не активна'}
+
+        entity = await asyncio.wait_for(
+            client.get_entity(f"@{bot_username}"), timeout=TELETHON_TIMEOUT
+        )
+
+        if link_type == "start":
+            await asyncio.wait_for(
+                client.send_message(entity, f"/start {ref_param}"),
+                timeout=TELETHON_TIMEOUT
+            )
+            logger.info(f"[Refka] do_refka OK (start): {session_path} → @{bot_username} ref={ref_param}")
+
+        elif link_type == "startapp":
+            await asyncio.wait_for(
+                client.invoke(RequestWebViewRequest(
+                    peer=entity,
+                    bot=entity,
+                    platform="android",
+                    url=f"https://t.me/{bot_username}/app?startapp={ref_param}",
+                    from_background=False,
+                )),
+                timeout=TELETHON_TIMEOUT
+            )
+            logger.info(f"[Refka] do_refka OK (startapp): {session_path} → @{bot_username} ref={ref_param}")
+
+        return {'success': True}
+
+    except asyncio.TimeoutError:
+        logger.warning(f"[Refka] do_refka TIMEOUT: {session_path}")
+        return {'success': False, 'error': 'Таймаут'}
+    except Exception as e:
+        logger.warning(f"[Refka] do_refka ERROR: {session_path} → {e}")
         return {'success': False, 'error': str(e)}
     finally:
         await safe_disconnect(client)
@@ -315,6 +385,75 @@ async def run_advanced_reactions(update, user_id, link, reaction_plan, view_sess
     active_tasks.discard(user_id)
 
 # ───────────────────────────────────────────
+#  ЛОГИКА РЕФКИ
+# ───────────────────────────────────────────
+
+async def run_refka(update, user_id, bot_username, link_type, ref_param, selected_accounts):
+    """Запускает переходы по реферальной ссылке для выбранных аккаунтов."""
+    active_tasks.add(user_id)
+    total = len(selected_accounts)
+    logger.info(
+        f"[Refka] START: user={user_id}, bot=@{bot_username}, "
+        f"type={link_type}, ref={ref_param}, accounts={total}"
+    )
+
+    await update.message.reply_text(
+        f"🚀 *Рефка запущена*\n\n"
+        f"🤖 Бот: `@{bot_username}`\n"
+        f"🔗 Тип: `{link_type}={ref_param}`\n"
+        f"👥 Аккаунтов: *{total}*\n"
+        f"⏱ Задержка: 3–8 сек между аккаунтами",
+        parse_mode="Markdown"
+    )
+
+    results = []
+    for i, acc in enumerate(selected_accounts):
+        phone        = acc[1]
+        session_path = acc[2]
+
+        result = await do_refka(session_path, bot_username, link_type, ref_param)
+        result['phone'] = phone
+        results.append(result)
+
+        logger.info(
+            f"[Refka] [{i+1}/{total}] {phone} → {'OK' if result['success'] else result['error']}"
+        )
+
+        # Задержка между аккаунтами (кроме последнего)
+        if i < total - 1:
+            delay = random.uniform(3, 8)
+            logger.info(f"[Refka] Пауза {delay:.1f} сек.")
+            await asyncio.sleep(delay)
+
+    # ── Отчёт ──
+    success_count = sum(1 for r in results if r['success'])
+    error_count   = len(results) - success_count
+
+    lines = [
+        f"📊 *Отчёт по рефке* `@{bot_username}`\n",
+        f"✅ Успешно: *{success_count}*",
+        f"❌ Ошибок:  *{error_count}*",
+        f"━━━━━━━━━━━━━━━━━━━━\n",
+    ]
+    for r in results:
+        if r['success']:
+            lines.append(f"✅ `{r['phone']}` — успех")
+        else:
+            err = (r.get('error') or 'неизвестная ошибка')[:50]
+            lines.append(f"❌ `{r['phone']}` — {err}")
+
+    report = "\n".join(lines)
+    await update.message.reply_text(
+        report,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(BACK_BUTTON)
+    )
+    logger.info(
+        f"[Refka] DONE: user={user_id}, success={success_count}, errors={error_count}"
+    )
+    active_tasks.discard(user_id)
+
+# ───────────────────────────────────────────
 #  HANDLERS
 # ───────────────────────────────────────────
 
@@ -340,9 +479,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── ZIP-архив ──
     if document.file_name.endswith('.zip'):
         await update.message.reply_text("⏳ Загружаю архив...")
+        zip_path = None
+        extract_path = None
         try:
-            file        = await document.get_file()
-            zip_path    = f"/tmp/{document.file_name}"
+            file         = await document.get_file()
+            zip_path     = f"/tmp/{document.file_name}"
             extract_path = "/tmp/sessions_extract"
             await file.download_to_drive(zip_path)
             os.makedirs(extract_path, exist_ok=True)
@@ -397,8 +538,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"ZIP upload error: {e}")
             await update.message.reply_text(f"❌ Ошибка: {e}")
         finally:
-            for p in [zip_path if 'zip_path' in dir() else None,
-                      extract_path if 'extract_path' in dir() else None]:
+            for p in [zip_path, extract_path]:
                 if p and os.path.exists(p):
                     try:
                         if os.path.isdir(p): shutil.rmtree(p)
@@ -446,6 +586,80 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text  = update.message.text.strip()
     state = user_states.get(user_id, {})
+
+    # ══════════════════════════════════════════
+    #  РЕФКА: шаг 1 — получаем ссылку
+    # ══════════════════════════════════════════
+    if state.get('step') == 'waiting_refka_link':
+        try:
+            bot_username, link_type, ref_param = parse_refka_link(text)
+        except ValueError as e:
+            await update.message.reply_text(
+                f"❌ Неверная ссылка: {e}\n\n"
+                f"Примеры:\n"
+                f"`https://t.me/username?start=ref`\n"
+                f"`https://t.me/username/app?startapp=ref`",
+                parse_mode="Markdown"
+            )
+            return
+
+        accounts = get_accounts()
+        if not accounts:
+            await update.message.reply_text("❌ Нет активных аккаунтов в базе.")
+            user_states.pop(user_id, None)
+            return
+
+        phones_list = "\n".join(
+            f"  {i+1}\\. `{acc[1]}`" for i, acc in enumerate(accounts)
+        )
+        user_states[user_id] = {
+            'step': 'waiting_refka_count',
+            'bot_username': bot_username,
+            'link_type': link_type,
+            'ref_param': ref_param,
+            'accounts': accounts,
+        }
+        await update.message.reply_text(
+            f"✅ Ссылка принята\\!\n\n"
+            f"🤖 Бот: `@{bot_username}`\n"
+            f"🔗 Тип: `{link_type}={ref_param}`\n\n"
+            f"📋 *Активные аккаунты \\({len(accounts)} шт\\.\\):*\n"
+            f"{phones_list}\n\n"
+            f"Введи количество аккаунтов для перехода \\(1–{len(accounts)}\\):",
+            parse_mode="MarkdownV2"
+        )
+        return
+
+    # ══════════════════════════════════════════
+    #  РЕФКА: шаг 2 — получаем количество
+    # ══════════════════════════════════════════
+    if state.get('step') == 'waiting_refka_count':
+        accounts = state['accounts']
+        if not text.isdigit():
+            await update.message.reply_text("❌ Введи целое число!")
+            return
+        count = int(text)
+        if not (1 <= count <= len(accounts)):
+            await update.message.reply_text(f"❌ Число от 1 до {len(accounts)}!")
+            return
+
+        if user_id in active_tasks:
+            await update.message.reply_text("⚠️ Задача уже запущена, подожди завершения!")
+            return
+
+        selected = random.sample(accounts, count)
+        user_states.pop(user_id, None)
+
+        # Запускаем задачу
+        asyncio.create_task(run_refka(
+            update,
+            user_id,
+            state['bot_username'],
+            state['link_type'],
+            state['ref_param'],
+            selected,
+        ))
+        return
 
     # ── Реакции: шаг 1 — ссылка ──
     if state.get('step') == 'waiting_reaction_link':
@@ -632,7 +846,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         row = cursor.fetchone()
         if row:
             status_info, phone = row
-            # Учитываем что статус может быть "✅ Активен" или просто "Активен"
             if "Активен" in status_info:
                 new_status = "Отключен"
                 icon = "⛔"
@@ -759,6 +972,34 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
         user_states[user_id] = {'step': 'waiting_link'}
+        return
+
+    # ══════════════════════════════════════════
+    #  РЕФКА (старт) — кнопка в главном меню
+    # ══════════════════════════════════════════
+    if data == "refka":
+        if user_id in active_tasks:
+            await query.edit_message_text(
+                "⚠️ Задача уже запущена, подожди завершения!",
+                reply_markup=InlineKeyboardMarkup(BACK_BUTTON)
+            )
+            return
+        accounts = get_accounts()
+        if not accounts:
+            await query.edit_message_text(
+                "❌ Нет активных аккаунтов в базе!",
+                reply_markup=InlineKeyboardMarkup(BACK_BUTTON)
+            )
+            return
+        await query.edit_message_text(
+            "🔗 *Рефка \\(старт\\)*\n\n"
+            "Отправь ссылку на Telegram\\-бота:\n\n"
+            "`https://t.me/username?start=ref`\n"
+            "или\n"
+            "`https://t.me/username/app?startapp=ref`",
+            parse_mode="MarkdownV2"
+        )
+        user_states[user_id] = {'step': 'waiting_refka_link'}
         return
 
     # ── Экспорт аккаунтов ──
