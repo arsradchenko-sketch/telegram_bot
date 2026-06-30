@@ -15,6 +15,7 @@ from telethon.tl.functions.messages import (
     SendReactionRequest, GetMessagesViewsRequest,
     RequestWebViewRequest, GetBotCallbackAnswerRequest
 )
+from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.types import ReactionEmoji
 from urllib.parse import urlparse, parse_qs
 
@@ -31,6 +32,12 @@ TELETHON_TIMEOUT = 30
 os.makedirs("data", exist_ok=True)
 os.makedirs("data/sessions", exist_ok=True)
 os.makedirs("data/logs", exist_ok=True)
+
+# Список «белых» безопасных каналов для прогрева хуманизатора
+WHITE_CHANNELS = [
+    "breakingmash", "tginfo", "durov", "popularmechanics", 
+    "pika_memes", "leprum", "rbc_news", "varlamov_news", "gazetaru"
+]
 
 # ───────────────────────────────────────────
 #  ЛОГИРОВАНИЕ
@@ -112,7 +119,8 @@ def add_account(phone, session_path, name="Неизвестно", status_info="�
     )
 
 def get_accounts():
-    cursor.execute('SELECT * FROM accounts WHERE status = "active"')
+    # ФИКС БАГА: Фильтруем только по реально активным в текущий момент аккаунтам
+    cursor.execute('SELECT * FROM accounts WHERE status_info LIKE "%Активен%"')
     return cursor.fetchall()
 
 # ───────────────────────────────────────────
@@ -241,6 +249,7 @@ MAIN_KEYBOARD = [
     [InlineKeyboardButton("🔥 Реакции",           callback_data="reaction")],
     [InlineKeyboardButton("🚀 Абуз TApp",         callback_data="abuse")],
     [InlineKeyboardButton("🔗 Рефка (старт)",     callback_data="refka")],
+    [InlineKeyboardButton("🧼 Хуманизатор",        callback_data="humanizer")],
     [InlineKeyboardButton("📤 Экспорт аккаунтов", callback_data="export")],
     [InlineKeyboardButton("📈 Аналитика",         callback_data="analytics")],
 ]
@@ -522,6 +531,109 @@ async def click_button_by_text(session_path, bot_username: str, button_text_frag
         await safe_disconnect(client)
 
 # ───────────────────────────────────────────
+#  ЛОГИКА ХУМАНИЗАТОРА (ПРОГРЕВА)
+# ───────────────────────────────────────────
+
+async def warmup_account(session_path, channel_username):
+    """Имитирует действия человека в конкретном канале."""
+    client = TelegramClient(session_path, API_ID, API_HASH)
+    try:
+        await asyncio.wait_for(client.connect(), timeout=TELETHON_TIMEOUT)
+        if not await client.is_user_authorized():
+            return {'success': False, 'error': 'Сессия не активна'}
+        
+        # С шансом 30% подписываемся на канал
+        if random.random() < 0.3:
+            try:
+                await client(JoinChannelRequest(f"@{channel_username}"))
+                await asyncio.sleep(random.uniform(3, 7))
+            except Exception:
+                pass
+
+        entity = await client.get_entity(f"@{channel_username}")
+        messages = await client.get_messages(entity, limit=random.randint(4, 8))
+        
+        reactions_set = 0
+        for msg in messages:
+            # Имитируем чтение поста (скроллинг)
+            await asyncio.sleep(random.uniform(3, 6))
+            await client.send_read_acknowledge(entity, max_id=msg.id)
+            
+            # С шансом 15% прожимаем лайк, если реакции доступны
+            if random.random() < 0.15 and getattr(msg, 'reply_markup', None):
+                try:
+                    await client(SendReactionRequest(
+                        peer=entity, msg_id=msg.id, reaction=[ReactionEmoji(emoticon="👍")]
+                    ))
+                    reactions_set += 1
+                    await asyncio.sleep(random.uniform(1, 3))
+                except Exception:
+                    pass
+                    
+        return {'success': True, 'channel': channel_username, 'reactions': reactions_set}
+    except Exception as e:
+        return {'success': False, 'error': str(e)}
+    finally:
+        await safe_disconnect(client)
+
+async def run_humanizer_task(update, user_id, selected_accounts):
+    """Конкурентный запуск прогрева со смещением по времени."""
+    active_tasks.add(user_id)
+    total = len(selected_accounts)
+    
+    await update.message.reply_text(
+        f"🧼 *Хуманизатор запущен!*\n\n"
+        f"👥 Выбрано аккаунтов: *{total}*\n"
+        f"⏱ Запуск идет лесенкой с задержками, чтобы не привлекать внимание ТГ. Ожидайте отчёт...",
+        parse_mode="Markdown"
+    )
+    
+    success_count = 0
+    error_count = 0
+    report = []
+
+    random.shuffle(selected_accounts)
+
+    async def warm_single(acc, idx):
+        nonlocal success_count, error_count
+        phone = acc[1]
+        session_path = acc[2]
+        channel = random.choice(WHITE_CHANNELS)
+        
+        # Шахматный старт: каждый следующий аккаунт ждёт дольше перед входом в сеть
+        await asyncio.sleep(idx * random.uniform(8, 15))
+        
+        res = await warmup_account(session_path, channel)
+        if res['success']:
+            success_count += 1
+            report.append(f"✅ `{phone}` → прогрет в @{channel} (👍 {res['reactions']})")
+            log_action(phone, 'warmup', True, target=f"@{channel}")
+        else:
+            error_count += 1
+            err_msg = res.get('error', 'Ошибка')[:30]
+            report.append(f"❌ `{phone}` → ошибка: {err_msg}")
+            log_action(phone, 'warmup', False, error_msg=res.get('error'), target=f"@{channel}")
+
+    tasks = [warm_single(acc, i) for i, acc in enumerate(selected_accounts)]
+    await asyncio.gather(*tasks)
+
+    log_task('humanizer', total, success_count, error_count, details="Массовый автоматический прогрев")
+
+    report_lines = "\n".join(report[:15])
+    if len(report) > 15:
+        report_lines += f"\n...и ещё {len(report) - 15} акк."
+
+    await update.message.reply_text(
+        f"📊 *Отчёт хуманизатора:*\n\n"
+        f"✅ Успешно прогрето: *{success_count}*\n"
+        f"❌ Ошибок: *{error_count}*\n\n"
+        f"*Детали:*\n{report_lines}",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(BACK_BUTTON)
+    )
+    active_tasks.discard(user_id)
+
+# ───────────────────────────────────────────
 #  ЛОГИКА РАСШИРЕННЫХ РЕАКЦИЙ
 # ───────────────────────────────────────────
 
@@ -551,7 +663,6 @@ async def run_advanced_reactions(update, user_id, link, reaction_plan, view_sess
     random.shuffle(shuffled_viewers)
 
     for session_path in shuffled_viewers:
-        # Получаем телефон из БД по session_path
         cursor.execute('SELECT phone FROM accounts WHERE session_path = ?', (session_path,))
         row = cursor.fetchone()
         phone = row[0] if row else session_path
@@ -597,7 +708,6 @@ async def run_advanced_reactions(update, user_id, link, reaction_plan, view_sess
                 log_action(phone, 'reaction', False, error_msg=result.get('error'), target=link)
             await asyncio.sleep(random.uniform(3, 10))
 
-    # Записываем задачу в историю
     log_task('reactions', total_view_accs + total_reaction_accs,
              view_success + reaction_success, view_errors + reaction_errors,
              details=link)
@@ -615,8 +725,6 @@ async def run_advanced_reactions(update, user_id, link, reaction_plan, view_sess
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(BACK_BUTTON)
     )
-    logger.info(f"run_advanced_reactions DONE: user={user_id}, "
-                f"views={view_success}/{view_errors}, reactions={reaction_success}/{reaction_errors}")
     active_tasks.discard(user_id)
 
 # ───────────────────────────────────────────
@@ -640,7 +748,6 @@ async def _process_refka_accounts(update, user_id, bot_username, link_type, ref_
             result['btn_clicked'] = False
             result['btn_error']   = None
 
-        # Логируем рефку
         log_action(phone, 'refka', result['success'],
                    error_msg=result.get('error'), target=f"@{bot_username}")
 
@@ -651,12 +758,10 @@ async def _process_refka_accounts(update, user_id, bot_username, link_type, ref_
             if click['success']:
                 result['btn_clicked'] = True
                 log_action(phone, 'button_click', True, target=f"@{bot_username}:{button_text}")
-                logger.info(f"[Refka] [{i+1}/{len(accounts)}] {phone} -> кнопка '{click['button']}' OK")
             else:
                 result['btn_error'] = click['error']
                 log_action(phone, 'button_click', False,
                            error_msg=click['error'], target=f"@{bot_username}:{button_text}")
-                logger.warning(f"[Refka] [{i+1}/{len(accounts)}] {phone} -> кнопка не нажата: {click['error']}")
 
         results.append(result)
 
@@ -697,7 +802,6 @@ async def _process_refka_accounts(update, user_id, bot_username, link_type, ref_
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(BACK_BUTTON)
     )
-    logger.info(f"[Refka] DONE: user={user_id}, success={success_count}, errors={error_count}, btn_ok={btn_click_ok}")
     active_tasks.discard(user_id)
 
 
@@ -719,8 +823,7 @@ async def run_refka_with_button_detect(update, user_id, bot_username, link_type,
         log_action(first_acc[1], 'refka', False,
                    error_msg=result.get('error'), target=f"@{bot_username}")
         await update.message.reply_text(
-            f"❌ Первый аккаунт не прошёл: {result.get('error', '?')}\n"
-            f"Попробуй ещё раз.",
+            f"❌ Первый аккаунт не прошёл: {result.get('error', '?')}\nПопробуй ещё раз.",
             reply_markup=InlineKeyboardMarkup(BACK_BUTTON)
         )
         active_tasks.discard(user_id)
@@ -742,9 +845,7 @@ async def run_refka_with_button_detect(update, user_id, bot_username, link_type,
             'first_done': True,
         }
         await update.message.reply_text(
-            "🖱 Кнопок не обнаружено в ответе бота.\n\n"
-            "Введи фрагмент текста кнопки вручную\n"
-            "или `-` если нажимать не нужно:",
+            "🖱 Кнопок не обнаружено в ответе бота.\n\nВведи фрагмент текста кнопки вручную или `-` если нажимать не нужно:",
             parse_mode="Markdown"
         )
         return
@@ -764,11 +865,8 @@ async def run_refka_with_button_detect(update, user_id, bot_username, link_type,
     }
 
     await update.message.reply_text(
-        f"🖱 *Кнопки в боте @{bot_username}:*\n\n"
-        + "\n".join(btn_lines) +
-        "\n\n✅ — можно нажать  |  🌐 WebApp — нельзя\n\n"
-        "Введи фрагмент текста кнопки для нажатия\n"
-        "или `-` чтобы не нажимать:",
+        f"🖱 *Кнопки в боте @{bot_username}:*\n\n" + "\n".join(btn_lines) +
+        "\n\n✅ — можно нажать  |  🌐 WebApp — нельзя\n\nВведи фрагмент текста кнопки для нажатия или `-` чтобы не нажимать:",
         parse_mode="Markdown"
     )
 
@@ -788,12 +886,11 @@ def format_analytics(days: int = 7) -> str:
         f"📈 *Аналитика за {days} дней*\n",
         f"━━━━━━━━━━━━━━━━━━━━",
         f"📌 Всего действий: *{total}*",
-        f"✅ Успешных:  *{success}*  {make_bar(success, total)}",
-        f"❌ Ошибок:    *{errors}*  {make_bar(errors, total)}",
+        f"✅ Успешных:  *{success}* {make_bar(success, total)}",
+        f"❌ Ошибок:    *{errors}* {make_bar(errors, total)}",
         f"📊 Успех:     *{rate}%*\n",
     ]
 
-    # По типам
     if s['by_type']:
         lines.append("🔧 *По типам действий:*")
         type_icons = {
@@ -802,6 +899,7 @@ def format_analytics(days: int = 7) -> str:
             'refka': '🔗',
             'button_click': '🖱',
             'tapp': '🚀',
+            'warmup': '🧼',
         }
         for action_type, cnt, ok in s['by_type']:
             icon = type_icons.get(action_type, '▪️')
@@ -811,7 +909,6 @@ def format_analytics(days: int = 7) -> str:
             lines.append(f"  {icon} {action_type}: {cnt} (✅{ok} ❌{err} {pct}%)")
         lines.append("")
 
-    # Активность по дням
     if s['daily']:
         lines.append("📅 *Активность по дням:*")
         for day, cnt, ok in s['daily']:
@@ -820,7 +917,6 @@ def format_analytics(days: int = 7) -> str:
             lines.append(f"  `{day}` {bar} {cnt} ({ok}✅)")
         lines.append("")
 
-    # Топ аккаунтов
     if s['top_accounts']:
         lines.append("🏆 *Топ аккаунтов:*")
         medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
@@ -831,9 +927,8 @@ def format_analytics(days: int = 7) -> str:
             lines.append(f"  {medal} `{phone}` — {cnt} действий ({pct}%)")
         lines.append("")
 
-    # Проблемные аккаунты
     if s['problem_accounts']:
-        lines.append("⚠️ *Проблемные аккаунты:*")
+        lines.append("⚠️ *Проблемные аккаунтов:*")
         for phone, cnt, errors in s['problem_accounts']:
             errors = errors or 0
             pct    = round((errors / cnt * 100) if cnt > 0 else 0)
@@ -850,6 +945,7 @@ def format_task_history() -> str:
         'reactions': '🔥',
         'refka':     '🔗',
         'tapp':      '🚀',
+        'humanizer': '🧼',
     }
 
     lines = ["📋 *История задач (последние 10):*\n", "━━━━━━━━━━━━━━━━━━━━"]
@@ -916,7 +1012,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Отправь файл!")
         return
 
-    # ── ZIP-архив ──
     if document.file_name.endswith('.zip'):
         await update.message.reply_text("⏳ Загружаю архив...")
         zip_path = None
@@ -986,7 +1081,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     except Exception: pass
         return
 
-    # ── Одиночный .session ──
     if not document.file_name.endswith('.session'):
         await update.message.reply_text("❌ Отправь .session или ZIP!")
         return
@@ -1012,7 +1106,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup(BACK_BUTTON)
         )
         user_states.pop(user_id, None)
-        logger.info(f"Session uploaded: {phone}")
     except Exception as e:
         logger.error(f"Session upload error: {e}")
         await update.message.reply_text(f"❌ Ошибка: {e}")
@@ -1027,31 +1120,41 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text  = update.message.text.strip()
     state = user_states.get(user_id, {})
 
-    # ══════════════════════════════════════════
-    #  АНАЛИТИКА — выбор аккаунта для детальной инфо
-    # ══════════════════════════════════════════
     if state.get('step') == 'waiting_analytics_phone':
         user_states.pop(user_id, None)
         msg = format_account_analytics(text)
-        await update.message.reply_text(
-            msg,
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(BACK_BUTTON)
-        )
+        await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(BACK_BUTTON))
         return
 
     # ══════════════════════════════════════════
-    #  РЕФКА: шаг 1 — получаем ссылку
+    #  ХУМАНИЗАТОР: обработка количества аккаунтов
     # ══════════════════════════════════════════
+    if state.get('step') == 'waiting_humanizer_count':
+        accounts = state['accounts']
+        if not text.isdigit():
+            await update.message.reply_text("❌ Введи целое число!")
+            return
+        count = int(text)
+        if not (1 <= count <= len(accounts)):
+            await update.message.reply_text(f"❌ Число от 1 до {len(accounts)}!")
+            return
+
+        selected = random.sample(accounts, count)
+        user_states.pop(user_id, None)
+
+        if user_id in active_tasks:
+            await update.message.reply_text("⚠️ Задача уже запущена, подожди завершения!")
+            return
+
+        asyncio.create_task(run_humanizer_task(update, user_id, selected))
+        return
+
     if state.get('step') == 'waiting_refka_link':
         try:
             bot_username, link_type, ref_param = parse_refka_link(text)
         except ValueError as e:
             await update.message.reply_text(
-                f"❌ Неверная ссылка: {e}\n\n"
-                f"Примеры:\n"
-                f"`https://t.me/username?start=ref`\n"
-                f"`https://t.me/username/app?startapp=ref`",
+                f"❌ Неверная ссылка: {e}\n\nПримеры:\n`https://t.me/username?start=ref`\n`https://t.me/username/app?startapp=ref`",
                 parse_mode="Markdown"
             )
             return
@@ -1062,9 +1165,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_states.pop(user_id, None)
             return
 
-        phones_list = "\n".join(
-            f"  {i+1}. `{acc[1]}`" for i, acc in enumerate(accounts)
-        )
+        phones_list = "\n".join(f"  {i+1}. `{acc[1]}`" for i, acc in enumerate(accounts))
         user_states[user_id] = {
             'step': 'waiting_refka_count',
             'bot_username': bot_username,
@@ -1073,19 +1174,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'accounts': accounts,
         }
         await update.message.reply_text(
-            f"✅ Ссылка принята!\n\n"
-            f"🤖 Бот: `@{bot_username}`\n"
-            f"🔗 Тип: `{link_type}={ref_param}`\n\n"
-            f"📋 *Активные аккаунты ({len(accounts)} шт.):*\n"
-            f"{phones_list}\n\n"
-            f"Введи количество аккаунтов для перехода (1–{len(accounts)}):",
+            f"✅ Ссылка принята!\n\n🤖 Бот: `@{bot_username}`\n🔗 Тип: `{link_type}={ref_param}`\n\n📋 *Активные аккаунты ({len(accounts)} шт.):*\n{phones_list}\n\nВведи количество аккаунтов для перехода (1–{len(accounts)}):",
             parse_mode="Markdown"
         )
         return
 
-    # ══════════════════════════════════════════
-    #  РЕФКА: шаг 2 — получаем количество
-    # ══════════════════════════════════════════
     if state.get('step') == 'waiting_refka_count':
         accounts = state['accounts']
         if not text.isdigit():
@@ -1103,18 +1196,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⚠️ Задача уже запущена, подожди завершения!")
             return
 
-        asyncio.create_task(run_refka_with_button_detect(
-            update, user_id,
-            state['bot_username'],
-            state['link_type'],
-            state['ref_param'],
-            selected,
-        ))
+        asyncio.create_task(run_refka_with_button_detect(update, user_id, state['bot_username'], state['link_type'], state['ref_param'], selected))
         return
 
-    # ══════════════════════════════════════════
-    #  РЕФКА: шаг 3 — текст кнопки
-    # ══════════════════════════════════════════
     if state.get('step') == 'waiting_refka_button':
         if user_id in active_tasks:
             await update.message.reply_text("⚠️ Задача уже запущена, подожди завершения!")
@@ -1125,19 +1209,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         first_done  = state.get('first_done', False)
         user_states.pop(user_id, None)
 
-        asyncio.create_task(_process_refka_accounts(
-            update,
-            user_id,
-            state['bot_username'],
-            state['link_type'],
-            state['ref_param'],
-            selected,
-            button_text,
-            skip_first=first_done,
-        ))
+        asyncio.create_task(_process_refka_accounts(update, user_id, state['bot_username'], state['link_type'], state['ref_param'], selected, button_text, skip_first=first_done))
         return
 
-    # ── Реакции: шаг 1 — ссылка ──
     if state.get('step') == 'waiting_reaction_link':
         if 't.me' not in text or not re.search(r't\.me/[\w]+/\d+', text):
             await update.message.reply_text("❌ Неверная ссылка!\nПример: https://t.me/durov/123")
@@ -1150,14 +1224,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         user_states[user_id] = {'step': 'waiting_reaction_count', 'link': text, 'total': total}
         await update.message.reply_text(
-            f"✅ Ссылка принята!\n\n"
-            f"📱 Активных аккаунтов: *{total}*\n\n"
-            f"Сколько аккаунтов поставят реакции? (1–{total})",
+            f"✅ Ссылка принята!\n\n📱 Активных аккаунтов: *{total}*\n\nСколько аккаунтов поставят реакции? (1–{total})",
             parse_mode="Markdown"
         )
         return
 
-    # ── Реакции: шаг 2 — количество ──
     if state.get('step') == 'waiting_reaction_count':
         if not text.isdigit():
             await update.message.reply_text("❌ Введи число!")
@@ -1176,31 +1247,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'total': total
         }
         await update.message.reply_text(
-            f"👍 Реакции: {count} аккаунтов\n"
-            f"👁 Просмотры: {view_count} аккаунтов\n\n"
-            f"Задай распределение (сумма = *{count}*):\n"
-            f"Формат: `🔥3 ❤️2 ⚡2`\n\n"
-            f"Доступные: 🔥 ❤️ ⚡ 👍 👎 🎉 🤩 😢 💯 🤮",
+            f"👍 Реакции: {count} аккаунтов\n👁 Просмотры: {view_count} аккаунтов\n\nЗадай распределение (сумма = *{count}*):\nФормат: `🔥3 ❤️2 ⚡2`\n\nДоступные: 🔥 ❤️ ⚡ 👍 👎 🎉 🤩 😢 💯 🤮",
             parse_mode="Markdown"
         )
         return
 
-    # ── Реакции: шаг 3 — распределение ──
     if state.get('step') == 'waiting_reaction_distribution':
         reaction_count = state['reaction_count']
         parsed = parse_reaction_input(text)
         if not parsed:
-            await update.message.reply_text(
-                "❌ Не могу разобрать!\nПример: `🔥3 ❤️2 ⚡2`",
-                parse_mode="Markdown"
-            )
+            await update.message.reply_text("❌ Не могу разобрать!\nПример: `🔥3 ❤️2 ⚡2`", parse_mode="Markdown")
             return
         total_assigned = sum(c for _, c in parsed)
         if total_assigned != reaction_count:
-            await update.message.reply_text(
-                f"❌ Сумма {total_assigned} ≠ {reaction_count}!\nИсправь.",
-                parse_mode="Markdown"
-            )
+            await update.message.reply_text(f"❌ Сумма {total_assigned} ≠ {reaction_count}!\nИсправь.", parse_mode="Markdown")
             return
 
         accounts = get_accounts()
@@ -1221,8 +1281,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         plan_text += f"👁 Просмотры: {len(view_sessions)} аккаунтов\n"
         for emoji, sessions in reaction_plan:
             plan_text += f"{emoji} Реакция: {len(sessions)} аккаунтов\n"
-        plan_text += "\n⏱ Задержки: 2–6 сек (просмотры), 3–10 сек (реакции)\n"
-        plan_text += "Подтверди запуск — напиши *да* или *нет*"
+        plan_text += "\n⏱ Задержки: 2–6 сек (просмотры), 3–10 сек (реакции)\nПодтверди запуск — напиши *да* или *нет*"
 
         user_states[user_id] = {
             'step': 'waiting_reaction_confirm',
@@ -1233,7 +1292,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(plan_text, parse_mode="Markdown")
         return
 
-    # ── Реакции: шаг 4 — подтверждение ──
     if state.get('step') == 'waiting_reaction_confirm':
         if text.lower() in ('да', 'yes', 'go', 'старт', '+'):
             if user_id in active_tasks:
@@ -1246,13 +1304,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await run_advanced_reactions(update, user_id, link, reaction_plan, view_sessions)
         else:
             user_states.pop(user_id, None)
-            await update.message.reply_text(
-                "❌ Отменено.",
-                reply_markup=InlineKeyboardMarkup(BACK_BUTTON)
-            )
+            await update.message.reply_text("❌ Отменено.", reply_markup=InlineKeyboardMarkup(BACK_BUTTON))
         return
 
-    # ── TApp абуз ──
     if state.get('step') == 'waiting_link':
         if 't.me' not in text or 'startapp' not in text:
             await update.message.reply_text("❌ Неверная ссылка!\nПример: https://t.me/bot/app?startapp=ref")
@@ -1289,11 +1343,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log_task('tapp', len(accounts), success_count, error_count, details=text)
 
         await update.message.reply_text(
-            f"📊 *Отчёт по абузу:*\n\n"
-            f"✅ Успешно: {success_count}\n"
-            f"❌ Ошибок: {error_count}\n"
-            f"📌 Всего: {success_count + error_count}\n\n"
-            f"Детали:\n" + "\n".join(report[:10]),
+            f"📊 *Отчёт по абузу:*\n\n✅ Успешно: {success_count}\n❌ Ошибок: {error_count}\n📌 Всего: {success_count + error_count}\n\nДетали:\n" + "\n".join(report[:10]),
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(BACK_BUTTON)
         )
@@ -1311,16 +1361,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data  = query.data
     state = user_states.get(user_id, {})
 
-    # ── Удалить аккаунт ──
     if data.startswith('delete_'):
         acc_id = int(data.split('_')[1])
         db_execute("DELETE FROM accounts WHERE id = ?", (acc_id,))
-        logger.info(f"Account deleted: id={acc_id}")
         keyboard = [[InlineKeyboardButton("📋 Назад к списку", callback_data="full_list")]] + BACK_BUTTON
         await query.edit_message_text(f"✅ Аккаунт #{acc_id} удалён!", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
-    # ── Включить/Отключить аккаунт ──
     if data.startswith('toggle_'):
         acc_id = int(data.split('_')[1])
         cursor.execute("SELECT status_info, phone FROM accounts WHERE id = ?", (acc_id,))
@@ -1334,18 +1381,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 new_status = "Активен"
                 icon = "✅"
             db_execute("UPDATE accounts SET status_info = ? WHERE id = ?", (new_status, acc_id))
-            logger.info(f"Account toggled: id={acc_id} -> {new_status}")
             keyboard = [[InlineKeyboardButton("📋 Назад к списку", callback_data="full_list")]] + BACK_BUTTON
-            await query.edit_message_text(
-                f"{icon} Аккаунт `{phone}` — *{new_status}*",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
+            await query.edit_message_text(f"{icon} Аккаунт `{phone}` — *{new_status}*", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
         else:
             await query.edit_message_text("❌ Аккаунт не найден!")
         return
 
-    # ── Пагинация ──
     if data.startswith('page_'):
         page = int(data.split('_')[1])
         user_states[user_id] = {**state, 'page': page}
@@ -1353,8 +1394,27 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ════════════════════════════════════════
-    #  АНАЛИТИКА
+    #  ХУМАНИЗАТОР — Главная кнопка в меню
     # ════════════════════════════════════════
+    if data == "humanizer":
+        if user_id in active_tasks:
+            await query.edit_message_text("⚠️ Сейчас уже идёт задача, подожди!", reply_markup=InlineKeyboardMarkup(BACK_BUTTON))
+            return
+        accounts = get_accounts()
+        total = len(accounts)
+        if not total:
+            await query.edit_message_text("❌ Нет активных аккаунтов в базе для прогрева!", reply_markup=InlineKeyboardMarkup(BACK_BUTTON))
+            return
+        await query.edit_message_text(
+            f"🧼 *Хуманизатор (Прогрев фермы)*\n\n"
+            f"Эта функция симулирует активность реального юзера: подписывается на крупные каналы, скроллит ленту, читает посты и прожимает лайки. Защищает ферму от ТГ детектов.\n\n"
+            f"📱 Всего активных аккаунтов: *{total}*\n\n"
+            f"Введи количество аккаунтов для прогрева (1–{total}):",
+            parse_mode="Markdown"
+        )
+        user_states[user_id] = {'step': 'waiting_humanizer_count', 'accounts': accounts}
+        return
+
     if data == "analytics":
         keyboard = [
             [InlineKeyboardButton("📅 За 7 дней",  callback_data="analytics_7")],
@@ -1362,70 +1422,38 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("📋 История задач", callback_data="analytics_tasks")],
             [InlineKeyboardButton("👤 По аккаунту", callback_data="analytics_account")],
         ] + BACK_BUTTON
-        await query.edit_message_text(
-            "📈 *Аналитика*\n\nВыбери раздел:",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
+        await query.edit_message_text("📈 *Аналитика*\n\nВыбери раздел:", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     if data == "analytics_7":
         msg = format_analytics(7)
-        await query.edit_message_text(
-            msg, parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("🔙 Назад", callback_data="analytics")]] + BACK_BUTTON
-            )
-        )
+        await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="analytics")]] + BACK_BUTTON))
         return
 
     if data == "analytics_30":
         msg = format_analytics(30)
-        await query.edit_message_text(
-            msg, parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("🔙 Назад", callback_data="analytics")]] + BACK_BUTTON
-            )
-        )
+        await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="analytics")]] + BACK_BUTTON))
         return
 
     if data == "analytics_tasks":
         msg = format_task_history()
-        await query.edit_message_text(
-            msg, parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("🔙 Назад", callback_data="analytics")]] + BACK_BUTTON
-            )
-        )
+        await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="analytics")]] + BACK_BUTTON))
         return
 
     if data == "analytics_account":
         accounts = get_accounts()
         if not accounts:
-            await query.edit_message_text(
-                "❌ Нет аккаунтов!",
-                reply_markup=InlineKeyboardMarkup(BACK_BUTTON)
-            )
+            await query.edit_message_text("❌ Нет аккаунтов!", reply_markup=InlineKeyboardMarkup(BACK_BUTTON))
             return
-        # Показываем список для выбора
         phones_list = "\n".join(f"  `{acc[1]}`" for acc in accounts[:20])
         user_states[user_id] = {'step': 'waiting_analytics_phone'}
-        await query.edit_message_text(
-            f"👤 *Аналитика по аккаунту*\n\n"
-            f"Аккаунты:\n{phones_list}\n\n"
-            f"Введи номер телефона (с +):",
-            parse_mode="Markdown"
-        )
+        await query.edit_message_text(f"👤 *Аналитика по аккаунту*\n\nАккаунты:\n{phones_list}\n\nВведи номер телефона (с +):", parse_mode="Markdown")
         return
 
-    # ── Статистика ──
     if data == "stats":
         accounts = get_accounts()
         if not accounts:
-            await query.edit_message_text(
-                "📊 Аккаунтов пока нет",
-                reply_markup=InlineKeyboardMarkup(BACK_BUTTON)
-            )
+            await query.edit_message_text("📊 Аккаунтов пока нет", reply_markup=InlineKeyboardMarkup(BACK_BUTTON))
             return
         total  = len(accounts)
         active = sum(1 for a in accounts if "Активен"  in a[5])
@@ -1433,7 +1461,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         error  = sum(1 for a in accounts if "Ошибка"   in a[5])
         off    = sum(1 for a in accounts if "Отключен" in a[5])
 
-        # Быстрая сводка из аналитики
         cursor.execute('SELECT COUNT(*), SUM(success) FROM analytics')
         row = cursor.fetchone()
         all_actions = row[0] or 0
@@ -1459,13 +1486,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
-    # ── Полный список ──
     if data == "full_list":
         page = state.get('page', 0)
         await _show_accounts_page(query, page)
         return
 
-    # ── Обновить статусы ──
     if data == "refresh":
         accounts = get_accounts()
         if not accounts:
@@ -1475,31 +1500,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for acc in accounts:
             acc_id, phone, session_path, *_ = acc
             check = await check_account_status(session_path)
-            db_execute('UPDATE accounts SET name = ?, status_info = ? WHERE id = ?',
-                       (check['name'], check['status'], acc_id))
-        await query.edit_message_text(
-            "✅ Статусы обновлены!",
-            reply_markup=InlineKeyboardMarkup(BACK_BUTTON)
-        )
+            db_execute('UPDATE accounts SET name = ?, status_info = ? WHERE id = ?', (check['name'], check['status'], acc_id))
+        await query.edit_message_text("✅ Статусы обновлены!", reply_markup=InlineKeyboardMarkup(BACK_BUTTON))
         return
 
-    # ── Главное меню ──
     if data == "main_menu":
         user_states.pop(user_id, None)
         await query.edit_message_text("👋 Выбери действие:", reply_markup=InlineKeyboardMarkup(MAIN_KEYBOARD))
         return
 
-    # ── Загрузить сессию ──
     if data == "upload_session":
-        await query.edit_message_text(
-            "📂 *Загрузка сессии*\n\n"
-            "Отправь `.session` файл или ZIP-архив с папкой `sessions/`.",
-            parse_mode="Markdown"
-        )
+        await query.edit_message_text("📂 *Загрузка сессии*\n\nОтправь `.session` файл или ZIP-архив с папкой `sessions/`.", parse_mode="Markdown")
         user_states[user_id] = {'step': 'waiting_session_file'}
         return
 
-    # ── Реакции ──
     if data == "reaction":
         accounts = get_accounts()
         total    = len(accounts)
@@ -1509,54 +1523,30 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user_id in active_tasks:
             await query.edit_message_text("⚠️ Сейчас уже идёт задача, подожди!", reply_markup=InlineKeyboardMarkup(BACK_BUTTON))
             return
-        await query.edit_message_text(
-            f"🔥 *Расширенные реакции*\n\n"
-            f"📱 Доступно аккаунтов: *{total}*\n\n"
-            f"Отправь ссылку на пост:\n`https://t.me/durov/123`",
-            parse_mode="Markdown"
-        )
+        await query.edit_message_text(f"🔥 *Расширенные реакции*\n\n📱 Доступно аккаунтов: *{total}*\n\nОтправь ссылку на пост:\n`https://t.me/durov/123`", parse_mode="Markdown")
         user_states[user_id] = {'step': 'waiting_reaction_link'}
         return
 
-    # ── Абуз TApp ──
     if data == "abuse":
         if user_id in active_tasks:
             await query.edit_message_text("⚠️ Сейчас уже идёт задача, подожди!", reply_markup=InlineKeyboardMarkup(BACK_BUTTON))
             return
-        await query.edit_message_text(
-            "🚀 Отправь ссылку TApp:\n`https://t.me/bot/app?startapp=ref`",
-            parse_mode="Markdown"
-        )
+        await query.edit_message_text("🚀 Отправь ссылку TApp:\n`https://t.me/bot/app?startapp=ref`", parse_mode="Markdown")
         user_states[user_id] = {'step': 'waiting_link'}
         return
 
-    # ── Рефка ──
     if data == "refka":
         if user_id in active_tasks:
-            await query.edit_message_text(
-                "⚠️ Задача уже запущена, подожди завершения!",
-                reply_markup=InlineKeyboardMarkup(BACK_BUTTON)
-            )
+            await query.edit_message_text("⚠️ Задача уже запущена, подожди завершения!", reply_markup=InlineKeyboardMarkup(BACK_BUTTON))
             return
         accounts = get_accounts()
         if not accounts:
-            await query.edit_message_text(
-                "❌ Нет активных аккаунтов в базе!",
-                reply_markup=InlineKeyboardMarkup(BACK_BUTTON)
-            )
+            await query.edit_message_text("❌ Нет активных аккаунтов в базе!", reply_markup=InlineKeyboardMarkup(BACK_BUTTON))
             return
-        await query.edit_message_text(
-            "🔗 *Рефка (старт)*\n\n"
-            "Отправь ссылку на Telegram-бота:\n\n"
-            "`https://t.me/username?start=ref`\n"
-            "или\n"
-            "`https://t.me/username/app?startapp=ref`",
-            parse_mode="Markdown"
-        )
+        await query.edit_message_text("🔗 *Рефка (старт)*\n\nОтправь ссылку на Telegram-бота:\n\n`https://t.me/username?start=ref`\nили\n`https://t.me/username/app?startapp=ref`", parse_mode="Markdown")
         user_states[user_id] = {'step': 'waiting_refka_link'}
         return
 
-    # ── Экспорт аккаунтов ──
     if data == "export":
         accounts = get_accounts()
         if not accounts:
@@ -1573,12 +1563,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f.write("\n".join(lines))
         await query.edit_message_text("📤 Отправляю файл...")
         with open(export_path, "rb") as f:
-            await context.bot.send_document(
-                chat_id=query.message.chat_id,
-                document=f,
-                filename="accounts.txt",
-                caption=f"📤 Экспорт {len(accounts)} аккаунтов"
-            )
+            await context.bot.send_document(chat_id=query.message.chat_id, document=f, filename="accounts.txt", caption=f"📤 Экспорт {len(accounts)} аккаунтов")
         await query.edit_message_text("✅ Готово!", reply_markup=InlineKeyboardMarkup(BACK_BUTTON))
         return
 
@@ -1622,17 +1607,4 @@ async def _show_accounts_page(query, page: int):
     if nav:
         keyboard.append(nav)
     keyboard += BACK_BUTTON
-    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
-
-# ───────────────────────────────────────────
-#  ЗАПУСК
-# ───────────────────────────────────────────
-
-if __name__ == "__main__":
-    logger.info("🚀 БОТ ЗАПУЩЕН!")
-    app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    app.run_polling()
+    await query
