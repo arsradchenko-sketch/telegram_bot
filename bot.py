@@ -120,7 +120,6 @@ def get_accounts():
 # ───────────────────────────────────────────
 
 def log_action(phone: str, action_type: str, success: bool, error_msg: str = None, target: str = None):
-    """Записывает действие аккаунта в таблицу аналитики."""
     cursor.execute('SELECT id FROM accounts WHERE phone = ?', (phone,))
     row = cursor.fetchone()
     account_id = row[0] if row else None
@@ -130,27 +129,22 @@ def log_action(phone: str, action_type: str, success: bool, error_msg: str = Non
     )
 
 def log_task(task_type: str, total: int, success: int, errors: int, details: str = None):
-    """Записывает итоги задачи в историю задач."""
     db_execute(
         'INSERT INTO task_history (task_type, total_accounts, success_count, error_count, details, created_at) VALUES (?, ?, ?, ?, ?, ?)',
         (task_type, total, success, errors, details, datetime.now().isoformat())
     )
 
 def get_analytics_summary(days: int = 7):
-    """Возвращает сводку аналитики за N дней."""
     since = (datetime.now() - timedelta(days=days)).isoformat()
     
-    # Общее количество действий
     cursor.execute('SELECT COUNT(*) FROM analytics WHERE created_at >= ?', (since,))
     total_actions = cursor.fetchone()[0]
 
-    # Успешные / ошибки
     cursor.execute('SELECT COUNT(*) FROM analytics WHERE created_at >= ? AND success = 1', (since,))
     total_success = cursor.fetchone()[0]
     cursor.execute('SELECT COUNT(*) FROM analytics WHERE created_at >= ? AND success = 0', (since,))
     total_errors = cursor.fetchone()[0]
 
-    # По типам действий
     cursor.execute('''
         SELECT action_type, COUNT(*) as cnt, SUM(success) as ok
         FROM analytics WHERE created_at >= ?
@@ -158,7 +152,6 @@ def get_analytics_summary(days: int = 7):
     ''', (since,))
     by_type = cursor.fetchall()
 
-    # Топ аккаунтов по успеху
     cursor.execute('''
         SELECT phone, COUNT(*) as cnt, SUM(success) as ok
         FROM analytics WHERE created_at >= ?
@@ -166,7 +159,6 @@ def get_analytics_summary(days: int = 7):
     ''', (since,))
     top_accounts = cursor.fetchall()
 
-    # Топ проблемных аккаунтов
     cursor.execute('''
         SELECT phone, COUNT(*) as cnt, SUM(CASE WHEN success=0 THEN 1 ELSE 0 END) as errors
         FROM analytics WHERE created_at >= ?
@@ -174,7 +166,6 @@ def get_analytics_summary(days: int = 7):
     ''', (since,))
     problem_accounts = cursor.fetchall()
 
-    # Активность по дням
     cursor.execute('''
         SELECT DATE(created_at) as day, COUNT(*) as cnt, SUM(success) as ok
         FROM analytics WHERE created_at >= ?
@@ -282,7 +273,6 @@ def parse_refka_link(url: str):
         raise ValueError("Не найден параметр ?start= или ?startapp= в ссылке.")
 
 def make_bar(value: int, total: int, length: int = 10) -> str:
-    """Текстовый прогресс-бар."""
     if total == 0:
         filled = 0
     else:
@@ -522,7 +512,7 @@ async def click_button_by_text(session_path, bot_username: str, button_text_frag
         await safe_disconnect(client)
 
 # ───────────────────────────────────────────
-#  ЛОГИКА РАСШИРЕННЫХ РЕАКЦИЙ
+#  ЛОГИКА РАСШИРЕННЫХ РЕАКЦИЙ (ИЗМЕНЕНА)
 # ───────────────────────────────────────────
 
 async def run_advanced_reactions(update, user_id, link, reaction_plan, view_sessions):
@@ -531,27 +521,27 @@ async def run_advanced_reactions(update, user_id, link, reaction_plan, view_sess
     channel_username = match.group(1)
     post_id = int(match.group(2))
 
-    total_reaction_accs = sum(len(accs) for _, accs in reaction_plan)
-    total_view_accs     = len(view_sessions)
+    total_view_accs = len(view_sessions)          # Все аккаунты
+    total_reaction_accs = sum(len(accs) for _, accs in reaction_plan)  # Сколько поставят реакции
 
     logger.info(f"run_advanced_reactions START: user={user_id}, link={link}, "
-                f"reactions={total_reaction_accs}, views={total_view_accs}")
+                f"views={total_view_accs}, reactions={total_reaction_accs}")
 
     await update.message.reply_text(
         f"🚀 *Запуск задачи:*\n"
-        f"👁 Просмотры: {total_view_accs} аккаунтов\n"
-        f"🔥 Реакции: {total_reaction_accs} аккаунтов\n"
+        f"👁 **Все {total_view_accs} аккаунтов** заходят на просмотр\n"
+        f"🔥 **{total_reaction_accs} аккаунтов** поставят реакции\n"
         f"⏱ Сначала просмотры, потом реакции...",
         parse_mode="Markdown"
     )
 
+    # ── Шаг 1: просмотры (ВСЕ аккаунты) ──
     view_success = 0
-    view_errors  = 0
+    view_errors = 0
     shuffled_viewers = list(view_sessions)
     random.shuffle(shuffled_viewers)
 
     for session_path in shuffled_viewers:
-        # Получаем телефон из БД по session_path
         cursor.execute('SELECT phone FROM accounts WHERE session_path = ?', (session_path,))
         row = cursor.fetchone()
         phone = row[0] if row else session_path
@@ -573,9 +563,10 @@ async def run_advanced_reactions(update, user_id, link, reaction_plan, view_sess
     )
     await asyncio.sleep(random.uniform(5, 15))
 
+    # ── Шаг 2: реакции (ТОЛЬКО выбранные аккаунты) ──
     reaction_success = 0
-    reaction_errors  = 0
-    reaction_report  = []
+    reaction_errors = 0
+    reaction_report = []
     shuffled_plan = list(reaction_plan)
     random.shuffle(shuffled_plan)
 
@@ -598,7 +589,7 @@ async def run_advanced_reactions(update, user_id, link, reaction_plan, view_sess
             await asyncio.sleep(random.uniform(3, 10))
 
     # Записываем задачу в историю
-    log_task('reactions', total_view_accs + total_reaction_accs,
+    log_task('reactions', total_view_accs,
              view_success + reaction_success, view_errors + reaction_errors,
              details=link)
 
@@ -610,8 +601,8 @@ async def run_advanced_reactions(update, user_id, link, reaction_plan, view_sess
         f"📊 *Итоговый отчёт:*\n\n"
         f"👁 Просмотры: ✅{view_success} / ❌{view_errors}\n"
         f"💬 Реакции:   ✅{reaction_success} / ❌{reaction_errors}\n"
-        f"📌 Всего аккаунтов: {total_view_accs + total_reaction_accs}\n\n"
-        f"*Детали:*\n{report_lines}",
+        f"📌 Всего аккаунтов задействовано: {total_view_accs}\n\n"
+        f"*Детали реакций:*\n{report_lines}",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(BACK_BUTTON)
     )
@@ -640,7 +631,6 @@ async def _process_refka_accounts(update, user_id, bot_username, link_type, ref_
             result['btn_clicked'] = False
             result['btn_error']   = None
 
-        # Логируем рефку
         log_action(phone, 'refka', result['success'],
                    error_msg=result.get('error'), target=f"@{bot_username}")
 
@@ -793,7 +783,6 @@ def format_analytics(days: int = 7) -> str:
         f"📊 Успех:     *{rate}%*\n",
     ]
 
-    # По типам
     if s['by_type']:
         lines.append("🔧 *По типам действий:*")
         type_icons = {
@@ -811,7 +800,6 @@ def format_analytics(days: int = 7) -> str:
             lines.append(f"  {icon} {action_type}: {cnt} (✅{ok} ❌{err} {pct}%)")
         lines.append("")
 
-    # Активность по дням
     if s['daily']:
         lines.append("📅 *Активность по дням:*")
         for day, cnt, ok in s['daily']:
@@ -820,7 +808,6 @@ def format_analytics(days: int = 7) -> str:
             lines.append(f"  `{day}` {bar} {cnt} ({ok}✅)")
         lines.append("")
 
-    # Топ аккаунтов
     if s['top_accounts']:
         lines.append("🏆 *Топ аккаунтов:*")
         medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
@@ -831,7 +818,6 @@ def format_analytics(days: int = 7) -> str:
             lines.append(f"  {medal} `{phone}` — {cnt} действий ({pct}%)")
         lines.append("")
 
-    # Проблемные аккаунты
     if s['problem_accounts']:
         lines.append("⚠️ *Проблемные аккаунты:*")
         for phone, cnt, errors in s['problem_accounts']:
@@ -1152,7 +1138,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"✅ Ссылка принята!\n\n"
             f"📱 Активных аккаунтов: *{total}*\n\n"
-            f"Сколько аккаунтов поставят реакции? (1–{total})",
+            f"Сколько аккаунтов поставят реакции? (0–{total})",
             parse_mode="Markdown"
         )
         return
@@ -1162,23 +1148,24 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not text.isdigit():
             await update.message.reply_text("❌ Введи число!")
             return
-        count = int(text)
         total = state['total']
-        if count < 1 or count > total:
-            await update.message.reply_text(f"❌ Число от 1 до {total}!")
+        reaction_count = int(text)
+        if reaction_count < 0 or reaction_count > total:
+            await update.message.reply_text(f"❌ Число от 0 до {total}!")
             return
-        view_count = total - count
+
+        # Все аккаунты идут на просмотр
         user_states[user_id] = {
             'step': 'waiting_reaction_distribution',
             'link': state['link'],
-            'reaction_count': count,
-            'view_count': view_count,
+            'reaction_count': reaction_count,
+            'view_count': total,  # ← ВСЕ аккаунты идут на просмотр
             'total': total
         }
         await update.message.reply_text(
-            f"👍 Реакции: {count} аккаунтов\n"
-            f"👁 Просмотры: {view_count} аккаунтов\n\n"
-            f"Задай распределение (сумма = *{count}*):\n"
+            f"👁 **Все {total} аккаунтов** зайдут на просмотр поста.\n"
+            f"🔥 **{reaction_count} аккаунтов** поставят реакции.\n\n"
+            f"Задай распределение реакций (сумма = **{reaction_count}**):\n"
             f"Формат: `🔥3 ❤️2 ⚡2`\n\n"
             f"Доступные: 🔥 ❤️ ⚡ 👍 👎 🎉 🤩 😢 💯 🤮",
             parse_mode="Markdown"
@@ -1205,8 +1192,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         accounts = get_accounts()
         random.shuffle(accounts)
+
+        # Все аккаунты идут на просмотр
+        view_sessions = [acc[2] for acc in accounts]
+
+        # Аккаунты для реакций (первые reaction_count из перемешанных)
         reaction_accs = accounts[:reaction_count]
-        view_accs     = accounts[reaction_count:]
 
         reaction_plan = []
         idx = 0
@@ -1215,10 +1206,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reaction_plan.append((emoji, group))
             idx += count
 
-        view_sessions = [acc[2] for acc in view_accs]
-
         plan_text  = "📋 *План действий:*\n\n"
-        plan_text += f"👁 Просмотры: {len(view_sessions)} аккаунтов\n"
+        plan_text += f"👁 **Все {len(view_sessions)} аккаунтов** → просмотр\n"
         for emoji, sessions in reaction_plan:
             plan_text += f"{emoji} Реакция: {len(sessions)} аккаунтов\n"
         plan_text += "\n⏱ Задержки: 2–6 сек (просмотры), 3–10 сек (реакции)\n"
@@ -1407,7 +1396,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=InlineKeyboardMarkup(BACK_BUTTON)
             )
             return
-        # Показываем список для выбора
         phones_list = "\n".join(f"  `{acc[1]}`" for acc in accounts[:20])
         user_states[user_id] = {'step': 'waiting_analytics_phone'}
         await query.edit_message_text(
@@ -1433,7 +1421,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         error  = sum(1 for a in accounts if "Ошибка"   in a[5])
         off    = sum(1 for a in accounts if "Отключен" in a[5])
 
-        # Быстрая сводка из аналитики
         cursor.execute('SELECT COUNT(*), SUM(success) FROM analytics')
         row = cursor.fetchone()
         all_actions = row[0] or 0
