@@ -380,7 +380,12 @@ async def open_tapp(session_path, link):
     finally:
         await safe_disconnect(client)
 
+# ===== НОВАЯ ФУНКЦИЯ РЕФКИ (ПОДДЕРЖИВАЕТ TAPPS) =====
 async def do_refka(session_path, bot_username: str, link_type: str, ref_param: str):
+    """
+    Открывает Telegram App (TApp) и автоматически входит.
+    link_type: 'startapp' — для TApps, 'start' — для обычных ботов.
+    """
     client = TelegramClient(session_path, API_ID, API_HASH)
     try:
         await asyncio.wait_for(client.connect(), timeout=TELETHON_TIMEOUT)
@@ -392,24 +397,35 @@ async def do_refka(session_path, bot_username: str, link_type: str, ref_param: s
         )
 
         if link_type == "start":
+            # Обычный бот → просто /start
             await asyncio.wait_for(
                 client.send_message(entity, f"/start {ref_param}"),
                 timeout=TELETHON_TIMEOUT
             )
-        elif link_type == "startapp":
-            await asyncio.wait_for(
-                client.invoke(RequestWebViewRequest(
-                    peer=entity,
-                    bot=entity,
-                    platform="android",
-                    url=f"https://t.me/{bot_username}/app?startapp={ref_param}",
-                    from_background=False,
-                )),
-                timeout=TELETHON_TIMEOUT
-            )
+            logger.info(f"[Refka] start OK: {session_path} -> @{bot_username} ref={ref_param}")
+            return {'success': True}
 
-        logger.info(f"[Refka] do_refka OK ({link_type}): {session_path} -> @{bot_username} ref={ref_param}")
-        return {'success': True}
+        elif link_type == "startapp":
+            # Telegram App → открываем WebView и автоматически входим
+            try:
+                webview = await asyncio.wait_for(
+                    client.invoke(RequestWebViewRequest(
+                        peer=entity,
+                        bot=entity,
+                        platform="android",
+                        url=f"https://t.me/{bot_username}/app?startapp={ref_param}",
+                        from_background=False,
+                    )),
+                    timeout=TELETHON_TIMEOUT
+                )
+                logger.info(f"[Refka] TApp OK: {session_path} -> @{bot_username} (WebView открыт)")
+                return {'success': True, 'webview_url': webview.url}
+            except Exception as e:
+                logger.warning(f"[Refka] TApp ERROR: {session_path} -> {e}")
+                return {'success': False, 'error': f'Ошибка WebView: {e}'}
+
+        else:
+            return {'success': False, 'error': f'Неизвестный тип ссылки: {link_type}'}
 
     except asyncio.TimeoutError:
         logger.warning(f"[Refka] do_refka TIMEOUT: {session_path}")
